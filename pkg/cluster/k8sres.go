@@ -1017,7 +1017,8 @@ func (c *Cluster) generateSpiloPodEnvVars(
 	if c.patroniUsesKubernetes() {
 		envVars = append(envVars, v1.EnvVar{Name: "DCS_ENABLE_KUBERNETES_API", Value: "true"})
 	} else {
-		envVars = append(envVars, v1.EnvVar{Name: "ETCD_HOST", Value: c.OpConfig.EtcdHost})
+		// OVH-CUSTOMIZATION
+		envVars = append(envVars, v1.EnvVar{Name: "ETCD3_URL", Value: c.OpConfig.EtcdHost})
 	}
 
 	if c.patroniKubernetesUseConfigMaps() {
