@@ -13,6 +13,7 @@ import (
 
 	"github.com/zalando/postgres-operator/pkg/util/constants"
 	httpclient "github.com/zalando/postgres-operator/pkg/util/httpclient"
+	"github.com/zalando/postgres-operator/pkg/util/retryutil"
 
 	"github.com/sirupsen/logrus"
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
@@ -36,6 +37,7 @@ type Interface interface {
 	SetPostgresParameters(server *v1.Pod, options map[string]string) error
 	SetStandbyClusterParameters(server *v1.Pod, options map[string]interface{}) error
 	GetMemberData(server *v1.Pod) (MemberData, error)
+	WaitForMemberState(memberPod *v1.Pod) error
 	Restart(server *v1.Pod) error
 	GetConfig(server *v1.Pod) (acidv1.Patroni, map[string]string, error)
 	SetConfig(server *v1.Pod, config map[string]interface{}) error
@@ -325,4 +327,30 @@ func (p *Patroni) GetMemberData(server *v1.Pod) (MemberData, error) {
 	}
 
 	return data, nil
+}
+
+// WaitForMemberState waits for Patroni member state to be running
+func (p *Patroni) WaitForMemberState(memberPod *v1.Pod) error {
+	const (
+		retryPeriod  = 1 * time.Second
+		retryTimeout = 10 * time.Second
+	)
+
+	return retryutil.Retry(retryPeriod, retryTimeout,
+		func() (bool, error) {
+			// Use GetClusterMembers instead of GetMemberData because data members states have some delay
+			members, err := p.GetClusterMembers(memberPod)
+			if err != nil {
+				return false, err
+			}
+
+			for _, member := range members {
+				if member.Name == memberPod.Name {
+					return member.State == "running", nil
+				}
+			}
+
+			return false, nil
+		},
+	)
 }

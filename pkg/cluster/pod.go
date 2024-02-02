@@ -396,10 +396,16 @@ func (c *Cluster) recreatePod(podName spec.NamespacedName) (*v1.Pod, error) {
 	if err := c.waitForPodDeletion(ch); err != nil {
 		return nil, err
 	}
+
 	pod, err := c.waitForPodLabel(ch, stopCh, nil)
 	if err != nil {
 		return nil, err
 	}
+
+	if err = c.patroni.WaitForMemberState(pod); err != nil {
+		return nil, err
+	}
+
 	c.logger.Infof("pod %q has been recreated", podName)
 	return pod, nil
 }
