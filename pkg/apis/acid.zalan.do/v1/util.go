@@ -88,7 +88,8 @@ func validateCloneClusterDescription(clone *CloneDescription) error {
 func (postgresStatus PostgresStatus) Success() bool {
 	return postgresStatus.PostgresClusterStatus != ClusterStatusAddFailed &&
 		postgresStatus.PostgresClusterStatus != ClusterStatusUpdateFailed &&
-		postgresStatus.PostgresClusterStatus != ClusterStatusSyncFailed
+		postgresStatus.PostgresClusterStatus != ClusterStatusSyncFailed &&
+		postgresStatus.PostgresClusterStatus != ClusterStatusInvalid // OVH MODIFIED: Prevent repair mechanism to stop with "repair is not required" when the status is "Invalid".
 }
 
 // Running status of cluster
