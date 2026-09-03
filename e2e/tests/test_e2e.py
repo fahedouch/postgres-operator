@@ -12,9 +12,9 @@ from kubernetes import client
 from tests.k8s_api import K8s
 from kubernetes.client.rest import ApiException
 
-SPILO_CURRENT = "registry.opensource.zalan.do/acid/spilo-16-e2e:0.1"
-SPILO_LAZY = "registry.opensource.zalan.do/acid/spilo-16-e2e:0.2"
-
+SPILO_CURRENT = "ghcr.io/zalando/spilo-e2e:dev-18.3"
+SPILO_LAZY = "ghcr.io/zalando/spilo-e2e:dev-18.4"
+SPILO_FULL_IMAGE = "ghcr.io/zalando/spilo-18:4.1-p2"
 
 def to_selector(labels):
     return ",".join(["=".join(lbl) for lbl in labels.items()])
@@ -95,7 +95,7 @@ class EndToEndTestCase(unittest.TestCase):
             print("Failed to delete the 'standard' storage class: {0}".format(e))
 
         # operator deploys pod service account there on start up
-        # needed for test_multi_namespace_support()
+        # needed for test_multi_namespace_support and test_owner_references
         cls.test_namespace = "test"
         try:
             v1_namespace = client.V1Namespace(metadata=client.V1ObjectMeta(name=cls.test_namespace))
@@ -115,6 +115,8 @@ class EndToEndTestCase(unittest.TestCase):
             configmap = yaml.safe_load(f)
             configmap["data"]["workers"] = "1"
             configmap["data"]["docker_image"] = SPILO_CURRENT
+            configmap["data"]["major_version_upgrade_mode"] = "full"
+            configmap["data"]["connection_pooler_image"] = os.environ['POOLER_IMAGE']
 
         with open("manifests/configmap.yaml", 'w') as f:
             yaml.dump(configmap, f, Dumper=yaml.Dumper)
@@ -150,6 +152,7 @@ class EndToEndTestCase(unittest.TestCase):
             'default', label_selector='name=postgres-operator').items[0].spec.containers[0].image
         print("Tested operator image: {}".format(actual_operator_image))  # shows up after tests finish
 
+        # load minimal Postgres manifest and wait for cluster to be up and running
         result = k8s.create_with_kubectl("manifests/minimal-postgres-manifest.yaml")
         print('stdout: {}, stderr: {}'.format(result.stdout, result.stderr))
         try:
@@ -400,8 +403,8 @@ class EndToEndTestCase(unittest.TestCase):
                         "max_connections": new_max_connections_value,
                         "wal_level": "logical"
                      }
-                 },
-                 "patroni": {
+                },
+                "patroni": {
                     "slots": {
                         "first_slot": {
                             "type": "physical"
@@ -412,7 +415,7 @@ class EndToEndTestCase(unittest.TestCase):
                     "retry_timeout": 9,
                     "synchronous_mode": True,
                     "failsafe_mode": True,
-                 }
+                }
             }
         }
 
@@ -515,7 +518,7 @@ class EndToEndTestCase(unittest.TestCase):
             pg_add_new_slots_patch = {
                 "spec": {
                     "patroni": {
-                         "slots": {
+                        "slots": {
                             "test_slot": {
                                 "type": "logical",
                                 "database": "foo",
@@ -558,7 +561,7 @@ class EndToEndTestCase(unittest.TestCase):
 
             pg_patch_config["spec"]["patroni"]["slots"][slot_to_change]["database"] = "bar"
             del pg_patch_config["spec"]["patroni"]["slots"][slot_to_remove]
-            
+
             k8s.api.custom_objects_api.patch_namespaced_custom_object(
                 "acid.zalan.do", "v1", "default", "postgresqls", "acid-minimal-cluster", pg_delete_slot_patch)
 
@@ -575,7 +578,7 @@ class EndToEndTestCase(unittest.TestCase):
 
             self.eventuallyEqual(lambda: self.query_database(leader.metadata.name, "postgres", get_slot_query%("database", slot_to_change))[0], "bar",
                 "The replication slot cannot be updated", 10, 5)
-            
+
             # make sure slot from Patroni didn't get deleted
             self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "postgres", get_slot_query%("slot_name", patroni_slot))), 1,
                 "The replication slot from Patroni gets deleted", 10, 5)
@@ -696,7 +699,7 @@ class EndToEndTestCase(unittest.TestCase):
         self.eventuallyEqual(lambda: k8s.count_running_pods(master_pooler_label), 2, "No pooler pods found")
         self.eventuallyEqual(lambda: k8s.count_running_pods(replica_pooler_label), 2, "No pooler replica pods found")
         self.eventuallyEqual(lambda: k8s.count_services_with_label(pooler_label), 2, "No pooler service found")
-        self.eventuallyEqual(lambda: k8s.count_secrets_with_label(pooler_label), 1, "Pooler secret not created")
+        self.eventuallyEqual(lambda: k8s.count_secrets_with_label(pooler_label), 3, "Not all pooler secrets found")
 
         # TLS still enabled so check existing env variables and volume mounts
         self.eventuallyEqual(lambda: k8s.count_pods_with_env_variable("CONNECTION_POOLER_CLIENT_TLS_CRT", pooler_label), 4, "TLS env variable CONNECTION_POOLER_CLIENT_TLS_CRT missing in pooler pods")
@@ -722,14 +725,12 @@ class EndToEndTestCase(unittest.TestCase):
 
         master_annotations = {
             "external-dns.alpha.kubernetes.io/hostname": "acid-minimal-cluster-pooler.default.db.example.com",
-            "service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout": "3600",
         }
         self.eventuallyTrue(lambda: k8s.check_service_annotations(
             master_pooler_label+","+pooler_label, master_annotations), "Wrong annotations")
 
         replica_annotations = {
             "external-dns.alpha.kubernetes.io/hostname": "acid-minimal-cluster-pooler-repl.default.db.example.com",
-            "service.beta.kubernetes.io/aws-load-balancer-connection-idle-timeout": "3600",
         }
         self.eventuallyTrue(lambda: k8s.check_service_annotations(
             replica_pooler_label+","+pooler_label, replica_annotations), "Wrong annotations")
@@ -756,7 +757,7 @@ class EndToEndTestCase(unittest.TestCase):
         self.eventuallyEqual(lambda: k8s.count_services_with_label(pooler_label),
                              1, "No pooler service found")
         self.eventuallyEqual(lambda: k8s.count_secrets_with_label(pooler_label),
-                             1, "Secret not created")
+                             2, "Not all pooler secrets created")
 
         # Turn off only replica connection pooler
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
@@ -784,7 +785,7 @@ class EndToEndTestCase(unittest.TestCase):
                              'ClusterIP',
                              "Expected LoadBalancer service type for master, found {}")
         self.eventuallyEqual(lambda: k8s.count_secrets_with_label(pooler_label),
-                             1, "Secret not created")
+                             2, "Not all pooler secrets created")
 
         # scale up connection pooler deployment
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
@@ -819,8 +820,8 @@ class EndToEndTestCase(unittest.TestCase):
                              0, "Pooler pods not scaled down")
         self.eventuallyEqual(lambda: k8s.count_services_with_label(pooler_label),
                              0, "Pooler service not removed")
-        self.eventuallyEqual(lambda: k8s.count_secrets_with_label('application=spilo,cluster-name=acid-minimal-cluster'),
-                             4, "Secrets not deleted")
+        self.eventuallyEqual(lambda: k8s.count_secrets_with_label(pooler_label),
+                             0, "Not all pooler secrets deleted")
 
         # Verify that all the databases have pooler schema installed.
         # Do this via psql, since otherwise we need to deal with
@@ -931,7 +932,7 @@ class EndToEndTestCase(unittest.TestCase):
                     },
                 }
             }
-            
+
             old_sts_creation_timestamp = sts.metadata.creation_timestamp
             k8s.api.apps_v1.patch_namespaced_stateful_set(sts.metadata.name, sts.metadata.namespace, annotation_patch)
             old_svc_creation_timestamp = svc.metadata.creation_timestamp
@@ -1002,7 +1003,8 @@ class EndToEndTestCase(unittest.TestCase):
                             "Origin": 2,
                             "IsDbOwner": False,
                             "Deleted": False,
-                            "Rotated": False
+                            "Rotated": False,
+                            "Degraded": False,
                         })
                         return True
                 except:
@@ -1181,31 +1183,143 @@ class EndToEndTestCase(unittest.TestCase):
         self.eventuallyEqual(lambda: len(k8s.get_patroni_running_members("acid-minimal-cluster-0")), 2, "Postgres status did not enter running")
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
-    @unittest.skip("Skipping this test until fixed")
     def test_major_version_upgrade(self):
-        k8s = self.k8s
-        result = k8s.create_with_kubectl("manifests/minimal-postgres-manifest-12.yaml")
-        self.eventuallyEqual(lambda: k8s.count_running_pods(labels="application=spilo,cluster-name=acid-upgrade-test"), 2, "No 2 pods running")
-        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+        """
+        Test major version upgrade: with full upgrade, maintenance window, and annotation
+        """
+        def check_version():
+            p = k8s.patroni_rest("acid-upgrade-test-0", "") or {}
+            version = p.get("server_version", 0) // 10000
+            return version
 
-        pg_patch_version = {
+        def get_annotations():
+            pg_manifest = k8s.api.custom_objects_api.get_namespaced_custom_object(
+                "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test")
+            annotations = pg_manifest["metadata"]["annotations"]
+            return annotations
+
+        k8s = self.k8s
+        cluster_label = 'application=spilo,cluster-name=acid-upgrade-test'
+
+        with open("manifests/minimal-postgres-lowest-version-manifest.yaml", 'r+') as f:
+            upgrade_manifest = yaml.safe_load(f)
+            upgrade_manifest["spec"]["dockerImage"] = SPILO_FULL_IMAGE
+
+        with open("manifests/minimal-postgres-lowest-version-manifest.yaml", 'w') as f:
+            yaml.dump(upgrade_manifest, f, Dumper=yaml.Dumper)
+
+        k8s.create_with_kubectl("manifests/minimal-postgres-lowest-version-manifest.yaml")
+        self.eventuallyEqual(lambda: k8s.count_running_pods(labels=cluster_label), 2, "No 2 pods running")
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+        self.eventuallyEqual(check_version, 14, "Version is not correct")
+
+        master_nodes, _ = k8s.get_cluster_nodes(cluster_labels=cluster_label)
+        # should upgrade immediately
+        pg_patch_version_higher_version = {
             "spec": {
-                "postgres": {
-                    "version": "14"
+                "postgresql": {
+                    "version": "15"
                 }
             }
         }
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
-            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version)
-
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version_higher_version)
         self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
 
-        def check_version_14():
-            p = k8s.get_patroni_state("acid-upgrade-test-0")
-            version = p["server_version"][0:2]
-            return version
+        k8s.wait_for_pod_failover(master_nodes, 'spilo-role=replica,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
+        self.eventuallyEqual(check_version, 15, "Version should be upgraded from 14 to 15")
 
-        self.eventuallyEqual(check_version_14, "14", "Version was not upgrade to 14")
+        # check if annotation for last upgrade's success is set
+        annotations = get_annotations()
+        self.assertIsNotNone(annotations.get("last-major-upgrade-success"), "Annotation for last upgrade's success is not set")
+
+        # should not upgrade because current time is not in maintenanceWindow
+        current_time = datetime.now()
+        maintenance_window_future = f"{(current_time+timedelta(minutes=60)).strftime('%H:%M')}-{(current_time+timedelta(minutes=120)).strftime('%H:%M')}"
+        pg_patch_version_higher_version_outside_mw = {
+            "spec": {
+                "postgresql": {
+                    "version": "16"
+                },
+                "maintenanceWindows": [
+                    maintenance_window_future
+                ]
+            }
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version_higher_version_outside_mw)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+        # no pod replacement outside of the maintenance window
+        k8s.wait_for_pod_start('spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
+        self.eventuallyEqual(check_version, 15, "Version should not be upgraded")
+
+        second_annotations = get_annotations()
+        self.assertIsNone(second_annotations.get("last-major-upgrade-failure"), "Annotation for last upgrade's failure should not be set")
+
+        # change maintenanceWindows to current
+        maintenance_window_current = f"{(current_time-timedelta(minutes=30)).strftime('%H:%M')}-{(current_time+timedelta(minutes=30)).strftime('%H:%M')}"
+        pg_patch_version_higher_version_in_mw = {
+            "spec": {
+                "postgresql": {
+                    "version": "16"
+                },
+                "maintenanceWindows": [
+                    maintenance_window_current
+                ]
+            }
+        }
+
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version_higher_version_in_mw)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+        k8s.wait_for_pod_failover(master_nodes, 'spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
+        self.eventuallyEqual(check_version, 16, "Version should be upgraded from 15 to 16")
+
+        # check if annotation for last upgrade's success is updated after second upgrade
+        third_annotations = get_annotations()
+        self.assertIsNotNone(third_annotations.get("last-major-upgrade-success"), "Annotation for last upgrade's success is not set")
+        self.assertNotEqual(annotations.get("last-major-upgrade-success"), third_annotations.get("last-major-upgrade-success"), "Annotation for last upgrade's success is not updated")
+
+        # test upgrade with failed upgrade annotation
+        pg_patch_version_highest_version = {
+            "metadata": {
+                "annotations": {
+                    "last-major-upgrade-failure": "2024-01-02T15:04:05Z"
+                },
+            },
+            "spec": {
+                "postgresql": {
+                    "version": "18"
+                },
+            },
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version_highest_version)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+        k8s.wait_for_pod_failover(master_nodes, 'spilo-role=replica,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
+        self.eventuallyEqual(check_version, 16, "Version should not be upgraded because annotation for last upgrade's failure is set")
+
+        # change the version back to 16 and should remove failure annotation
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-upgrade-test", pg_patch_version_higher_version_in_mw)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+        k8s.wait_for_pod_start('spilo-role=master,' + cluster_label)
+        k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
+
+        self.eventuallyEqual(check_version, 16, "Version should not be upgraded from 16")
+        fourth_annotations = get_annotations()
+        self.assertIsNone(fourth_annotations.get("last-major-upgrade-failure"), "Annotation for last upgrade's failure is not removed")
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_persistent_volume_claim_retention_policy(self):
@@ -1256,7 +1370,7 @@ class EndToEndTestCase(unittest.TestCase):
         }
         k8s.update_config(patch_scaled_policy_retain)
         self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
- 
+
         # decrease the number of instances
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
             'acid.zalan.do', 'v1', 'default', 'postgresqls', 'acid-minimal-cluster', pg_patch_scale_down_instances)
@@ -1316,7 +1430,7 @@ class EndToEndTestCase(unittest.TestCase):
         k8s.api.custom_objects_api.patch_namespaced_custom_object(
             "acid.zalan.do", "v1", "default", "postgresqls", "acid-minimal-cluster", pg_patch_resources)
         self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"},
-                             "Operator does not get in sync")
+                             "Operator does not get in sync", retries=120)
 
         # wait for switched over
         k8s.wait_for_pod_failover(replica_nodes, 'spilo-role=master,' + cluster_label)
@@ -1354,17 +1468,11 @@ class EndToEndTestCase(unittest.TestCase):
             k8s.wait_for_pod_start("spilo-role=master", self.test_namespace)
             k8s.wait_for_pod_start("spilo-role=replica", self.test_namespace)
             self.assert_master_is_unique(self.test_namespace, "acid-test-cluster")
+            # acid-test-cluster will be deleted in test_owner_references test
 
         except timeout_decorator.TimeoutError:
             print('Operator log: {}'.format(k8s.get_operator_log()))
             raise
-        finally:
-            # delete the new cluster so that the k8s_api.get_operator_state works correctly in subsequent tests
-            # ideally we should delete the 'test' namespace here but
-            # the pods inside the namespace stuck in the Terminating state making the test time out
-            k8s.api.custom_objects_api.delete_namespaced_custom_object(
-                "acid.zalan.do", "v1", self.test_namespace, "postgresqls", "acid-test-cluster")
-            time.sleep(5)
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     @unittest.skip("Skipping this test until fixed")
@@ -1539,7 +1647,6 @@ class EndToEndTestCase(unittest.TestCase):
         # toggle pod anti affinity to move replica away from master node
         self.assert_distributed_pods(master_nodes)
 
-
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_overwrite_pooler_deployment(self):
         pooler_name = 'acid-minimal-cluster-pooler'
@@ -1576,13 +1683,81 @@ class EndToEndTestCase(unittest.TestCase):
                              0, "Pooler pods not scaled down")
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    def test_owner_references(self):
+        '''
+           Enable owner references, test if resources get updated and test cascade deletion of test cluster.
+        '''
+        k8s = self.k8s
+        cluster_name = 'acid-test-cluster'
+        cluster_label = 'application=spilo,cluster-name={}'.format(cluster_name)
+        default_test_cluster = 'acid-minimal-cluster'
+
+        try:
+            # enable owner references in config
+            enable_owner_refs = {
+                "data": {
+                    "enable_owner_references": "true"
+                }
+            }
+            k8s.update_config(enable_owner_refs)
+            self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+            time.sleep(5)  # wait for the operator to sync the cluster and update resources
+
+            # check if child resources were updated with owner references
+            self.assertTrue(self.check_cluster_child_resources_owner_references(cluster_name, self.test_namespace), "Owner references not set on all child resources of {}".format(cluster_name))
+            self.assertTrue(self.check_cluster_child_resources_owner_references(default_test_cluster), "Owner references not set on all child resources of {}".format(default_test_cluster))
+
+            # delete the new cluster to test owner references
+            # and also to make k8s_api.get_operator_state work better in subsequent tests
+            # ideally we should delete the 'test' namespace here but the pods
+            # inside the namespace stuck in the Terminating state making the test time out
+            k8s.api.custom_objects_api.delete_namespaced_custom_object(
+                "acid.zalan.do", "v1", self.test_namespace, "postgresqls", cluster_name)
+
+            # child resources with owner references should be deleted via owner references
+            self.eventuallyEqual(lambda: k8s.count_pods_with_label(cluster_label), 0, "Pods not deleted")
+            self.eventuallyEqual(lambda: k8s.count_statefulsets_with_label(cluster_label), 0, "Statefulset not deleted")
+            self.eventuallyEqual(lambda: k8s.count_services_with_label(cluster_label), 0, "Services not deleted")
+            self.eventuallyEqual(lambda: k8s.count_endpoints_with_label(cluster_label), 0, "Endpoints not deleted")
+            self.eventuallyEqual(lambda: k8s.count_pdbs_with_label(cluster_label), 0, "Pod disruption budget not deleted")
+            self.eventuallyEqual(lambda: k8s.count_secrets_with_label(cluster_label), 0, "Secrets were not deleted")
+
+            time.sleep(5)  # wait for the operator to also delete the PVCs
+
+            # pvcs do not have an owner reference but will deleted by the operator almost immediately
+            self.eventuallyEqual(lambda: k8s.count_pvcs_with_label(cluster_label), 0, "PVCs not deleted")
+
+            # disable owner references in config
+            disable_owner_refs = {
+                "data": {
+                    "enable_owner_references": "false"
+                }
+            }
+            k8s.update_config(disable_owner_refs)
+            self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+            time.sleep(5)  # wait for the operator to remove owner references
+
+            # check if child resources were updated without Postgresql owner references
+            self.assertTrue(self.check_cluster_child_resources_owner_references(default_test_cluster, "default", True), "Owner references still present on some child resources of {}".format(default_test_cluster))
+
+        except timeout_decorator.TimeoutError:
+            print('Operator log: {}'.format(k8s.get_operator_log()))
+            raise
+
+    @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_password_rotation(self):
         '''
            Test password rotation and removal of users due to retention policy
         '''
         k8s = self.k8s
+        cluster_label = 'application=spilo,cluster-name=acid-minimal-cluster'
         leader = k8s.get_cluster_leader_pod()
         today = date.today()
+
+        # remember number of secrets to make sure it stays the same
+        secret_count = k8s.count_secrets_with_label(cluster_label)
 
         # enable password rotation for owner of foo database
         pg_patch_rotation_single_users = {
@@ -1624,7 +1799,7 @@ class EndToEndTestCase(unittest.TestCase):
             },
         }
         k8s.api.core_v1.patch_namespaced_secret(
-            name="foo-user.acid-minimal-cluster.credentials.postgresql.acid.zalan.do", 
+            name="foo-user.acid-minimal-cluster.credentials.postgresql.acid.zalan.do",
             namespace="default",
             body=secret_fake_rotation)
 
@@ -1639,8 +1814,9 @@ class EndToEndTestCase(unittest.TestCase):
         enable_password_rotation = {
             "data": {
                 "enable_password_rotation": "true",
+                "inherited_annotations": "environment",
                 "password_rotation_interval": "30",
-                "password_rotation_user_retention": "30",  # should be set to 60 
+                "password_rotation_user_retention": "30",  # should be set to 60
             },
         }
         k8s.update_config(enable_password_rotation)
@@ -1685,15 +1861,31 @@ class EndToEndTestCase(unittest.TestCase):
         self.eventuallyEqual(lambda: len(self.query_database_with_user(leader.metadata.name, "postgres", "SELECT 1", "foo_user")), 1,
             "Could not connect to the database with rotation user {}".format(rotation_user), 10, 5)
 
+        # add annotation which triggers syncSecrets call
+        pg_annotation_patch = {
+            "metadata": {
+                "annotations": {
+                    "environment": "test",
+                }
+            }
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default", "postgresqls", "acid-minimal-cluster", pg_annotation_patch)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+        time.sleep(10)
+        self.eventuallyEqual(lambda: k8s.count_secrets_with_label(cluster_label), secret_count, "Unexpected number of secrets")
+
         # check if rotation has been ignored for user from test_cross_namespace_secrets test
         db_user_secret = k8s.get_secret(username="test.db_user", namespace="test")
         secret_username = str(base64.b64decode(db_user_secret.data["username"]), 'utf-8')
-
         self.assertEqual("test.db_user", secret_username,
                         "Unexpected username in secret of test.db_user: expected {}, got {}".format("test.db_user", secret_username))
 
+        # check if annotation for secret has been updated
+        self.assertTrue("environment" in db_user_secret.metadata.annotations, "Added annotation was not propagated to secret")
+
         # disable password rotation for all other users (foo_user)
-        # and pick smaller intervals to see if the third fake rotation user is dropped 
+        # and pick smaller intervals to see if the third fake rotation user is dropped
         enable_password_rotation = {
             "data": {
                 "enable_password_rotation": "false",
@@ -1772,7 +1964,6 @@ class EndToEndTestCase(unittest.TestCase):
             k8s.wait_for_pod_start('spilo-role=replica,' + cluster_label)
             replica = k8s.get_cluster_replica_pod()
             self.assertTrue(replica.metadata.creation_timestamp > old_creation_timestamp, "Old master pod was not recreated")
-
 
         except timeout_decorator.TimeoutError:
             print('Operator log: {}'.format(k8s.get_operator_log()))
@@ -1930,7 +2121,7 @@ class EndToEndTestCase(unittest.TestCase):
         patch_sset_propagate_annotations = {
             "data": {
                 "downscaler_annotations": "deployment-time,downscaler/*",
-                "inherited_annotations": "owned-by",
+                "inherited_annotations": "environment,owned-by",
             }
         }
         k8s.update_config(patch_sset_propagate_annotations)
@@ -2009,130 +2200,138 @@ class EndToEndTestCase(unittest.TestCase):
             verbs=["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
         )
         cluster_role.rules.append(fes_cluster_role_rule)
-        k8s.api.rbac_api.patch_cluster_role("postgres-operator", cluster_role)
 
-        # create a table in one of the database of acid-minimal-cluster
-        create_stream_table = """
-            CREATE TABLE test_table (id int, payload jsonb);
-        """
-        self.query_database(leader.metadata.name, "foo", create_stream_table)
+        try:
+            k8s.api.rbac_api.patch_cluster_role("postgres-operator", cluster_role)
 
-        # update the manifest with the streams section
-        patch_streaming_config = {
-            "spec": {
-                 "patroni": {
-                    "slots": {
-                        "manual_slot": {
-                            "type": "physical"
-                        }
-                    }
-                 },
-                "streams": [
-                    {
-                        "applicationId": "test-app",
-                        "batchSize": 100,
-                        "database": "foo",
-                        "enableRecovery": True,
-                        "tables": {
-                            "test_table": {
-                                "eventType": "test-event",
-                                "idColumn": "id",
-                                "payloadColumn": "payload",
-                                "recoveryEventType": "test-event-dlq"
+            # create a table in one of the database of acid-minimal-cluster
+            create_stream_table = """
+                CREATE TABLE test_table (id int, payload jsonb);
+            """
+            self.query_database(leader.metadata.name, "foo", create_stream_table)
+
+            # update the manifest with the streams section
+            patch_streaming_config = {
+                "spec": {
+                    "patroni": {
+                        "slots": {
+                            "manual_slot": {
+                                "type": "physical"
                             }
                         }
                     },
-                    {
-                        "applicationId": "test-app2",
-                        "batchSize": 100,
-                        "database": "foo",
-                        "enableRecovery": True,
-                        "tables": {
-                            "test_non_exist_table": {
-                                "eventType": "test-event",
-                                "idColumn": "id",
-                                "payloadColumn": "payload",
-                                "recoveryEventType": "test-event-dlq"
+                    "streams": [
+                        {
+                            "applicationId": "test-app",
+                            "batchSize": 100,
+                            "cpu": "100m",
+                            "memory": "200Mi",
+                            "database": "foo",
+                            "enableRecovery": True,
+                            "tables": {
+                                "test_table": {
+                                    "eventType": "test-event",
+                                    "idColumn": "id",
+                                    "payloadColumn": "payload",
+                                    "recoveryEventType": "test-event-dlq"
+                                }
+                            }
+                        },
+                        {
+                            "applicationId": "test-app2",
+                            "batchSize": 100,
+                            "database": "foo",
+                            "enableRecovery": True,
+                            "tables": {
+                                "test_non_exist_table": {
+                                    "eventType": "test-event",
+                                    "idColumn": "id",
+                                    "payloadColumn": "payload",
+                                    "ignoreRecovery": True
+                                }
                             }
                         }
-                    }
-                ]
+                    ]
+                }
             }
-        }
-        k8s.api.custom_objects_api.patch_namespaced_custom_object(
-            'acid.zalan.do', 'v1', 'default', 'postgresqls', 'acid-minimal-cluster', patch_streaming_config)
-        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+            k8s.api.custom_objects_api.patch_namespaced_custom_object(
+                'acid.zalan.do', 'v1', 'default', 'postgresqls', 'acid-minimal-cluster', patch_streaming_config)
+            self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
 
-        # check if publication, slot, and fes resource are created
-        get_publication_query = """
-            SELECT * FROM pg_publication WHERE pubname = 'fes_foo_test_app';
-        """
-        get_slot_query = """
-            SELECT * FROM pg_replication_slots WHERE slot_name = 'fes_foo_test_app';
-        """
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query)), 1,
-            "Publication is not created", 10, 5)
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query)), 1,
-            "Replication slot is not created", 10, 5)
-        self.eventuallyEqual(lambda: len(k8s.api.custom_objects_api.list_namespaced_custom_object(
+            # check if publication, slot, and fes resource are created
+            get_publication_query = """
+                SELECT * FROM pg_publication WHERE pubname = 'fes_foo_test_app';
+            """
+            get_slot_query = """
+                SELECT * FROM pg_replication_slots WHERE slot_name = 'fes_foo_test_app';
+            """
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query)), 1,
+                "Publication is not created", 10, 5)
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query)), 1,
+                "Replication slot is not created", 10, 5)
+            self.eventuallyEqual(lambda: len(k8s.api.custom_objects_api.list_namespaced_custom_object(
                 "zalando.org", "v1", "default", "fabriceventstreams", label_selector="cluster-name=acid-minimal-cluster")["items"]), 1,
                 "Could not find Fabric Event Stream resource", 10, 5)
 
-        # check if the non-existing table in the stream section does not create a publication and slot
-        get_publication_query_not_exist_table = """
-            SELECT * FROM pg_publication WHERE pubname = 'fes_foo_test_app2';
-        """
-        get_slot_query_not_exist_table = """
-            SELECT * FROM pg_replication_slots WHERE slot_name = 'fes_foo_test_app2';
-        """
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query_not_exist_table)), 0,
-            "Publication is created for non-existing tables", 10, 5)
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query_not_exist_table)), 0,
-            "Replication slot is created for non-existing tables", 10, 5)
+            # check if the non-existing table in the stream section does not create a publication and slot
+            get_publication_query_not_exist_table = """
+                SELECT * FROM pg_publication WHERE pubname = 'fes_foo_test_app2';
+            """
+            get_slot_query_not_exist_table = """
+                SELECT * FROM pg_replication_slots WHERE slot_name = 'fes_foo_test_app2';
+            """
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query_not_exist_table)), 0,
+                "Publication is created for non-existing tables", 10, 5)
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query_not_exist_table)), 0,
+                "Replication slot is created for non-existing tables", 10, 5)
 
-        # grant create and ownership of test_table to foo_user, reset search path to default
-        grant_permission_foo_user = """
-            GRANT CREATE ON DATABASE foo TO foo_user;
-            ALTER TABLE test_table OWNER TO foo_user;
-            ALTER ROLE foo_user RESET search_path;
-        """
-        self.query_database(leader.metadata.name, "foo", grant_permission_foo_user)
-        # non-postgres user creates a publication
-        create_nonstream_publication = """
-            CREATE PUBLICATION mypublication FOR TABLE test_table;
-        """
-        self.query_database_with_user(leader.metadata.name, "foo", create_nonstream_publication, "foo_user")
+            # grant create and ownership of test_table to foo_user, reset search path to default
+            grant_permission_foo_user = """
+                GRANT CREATE ON DATABASE foo TO foo_user;
+                ALTER TABLE test_table OWNER TO foo_user;
+                ALTER ROLE foo_user RESET search_path;
+            """
+            self.query_database(leader.metadata.name, "foo", grant_permission_foo_user)
+            # non-postgres user creates a publication
+            create_nonstream_publication = """
+                CREATE PUBLICATION mypublication FOR TABLE test_table;
+            """
+            self.query_database_with_user(leader.metadata.name, "foo", create_nonstream_publication, "foo_user")
 
-        # remove the streams section from the manifest
-        patch_streaming_config_removal = {
-            "spec": {
-                "streams": []
+            # remove the streams section from the manifest
+            patch_streaming_config_removal = {
+                "spec": {
+                    "streams": []
+                }
             }
-        }
-        k8s.api.custom_objects_api.patch_namespaced_custom_object(
-            'acid.zalan.do', 'v1', 'default', 'postgresqls', 'acid-minimal-cluster', patch_streaming_config_removal)
-        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+            k8s.api.custom_objects_api.patch_namespaced_custom_object(
+                'acid.zalan.do', 'v1', 'default', 'postgresqls', 'acid-minimal-cluster', patch_streaming_config_removal)
+            self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
 
-        # check if publication, slot, and fes resource are removed
-        self.eventuallyEqual(lambda: len(k8s.api.custom_objects_api.list_namespaced_custom_object(
+            # check if publication, slot, and fes resource are removed
+            self.eventuallyEqual(lambda: len(k8s.api.custom_objects_api.list_namespaced_custom_object(
                 "zalando.org", "v1", "default", "fabriceventstreams", label_selector="cluster-name=acid-minimal-cluster")["items"]), 0,
                 'Could not delete Fabric Event Stream resource', 10, 5)
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query)), 0,
-            "Publication is not deleted", 10, 5)
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query)), 0,
-            "Replication slot is not deleted", 10, 5)
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_publication_query)), 0,
+                "Publication is not deleted", 10, 5)
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_slot_query)), 0,
+                "Replication slot is not deleted", 10, 5)
 
-        # check the manual_slot and mypublication should not get deleted
-        get_manual_slot_query = """
-            SELECT * FROM pg_replication_slots WHERE slot_name = 'manual_slot';
-        """
-        get_nonstream_publication_query = """
-            SELECT * FROM pg_publication WHERE pubname = 'mypublication';
-        """
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "postgres", get_manual_slot_query)), 1,
-            "Slot defined in patroni config is deleted", 10, 5)
-        self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_nonstream_publication_query)), 1,
-            "Publication defined not in stream section is deleted", 10, 5)
+            # check the manual_slot and mypublication should not get deleted
+            get_manual_slot_query = """
+                SELECT * FROM pg_replication_slots WHERE slot_name = 'manual_slot';
+            """
+            get_nonstream_publication_query = """
+                SELECT * FROM pg_publication WHERE pubname = 'mypublication';
+            """
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "postgres", get_manual_slot_query)), 1,
+                "Slot defined in patroni config is deleted", 10, 5)
+            self.eventuallyEqual(lambda: len(self.query_database(leader.metadata.name, "foo", get_nonstream_publication_query)), 1,
+                "Publication defined not in stream section is deleted", 10, 5)
+
+        except timeout_decorator.TimeoutError:
+            print('Operator log: {}'.format(k8s.get_operator_log()))
+            raise
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_taint_based_eviction(self):
@@ -2185,6 +2384,90 @@ class EndToEndTestCase(unittest.TestCase):
 
         # toggle pod anti affinity to move replica away from master node
         self.assert_distributed_pods(master_nodes)
+
+    @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    def test_topology_spread_constraints(self):
+        '''
+            Enable topologySpreadConstraints for pods
+        '''
+        k8s = self.k8s
+        cluster_labels = "application=spilo,cluster-name=acid-minimal-cluster"
+
+        # Verify we are in good state from potential previous tests
+        self.eventuallyEqual(lambda: k8s.count_running_pods(), 2, "No 2 pods running")
+
+        # patch the pvc retention policy to enable delete when scale down
+        patch_scaled_policy_delete = {
+            "data": {
+                "persistent_volume_claim_retention_policy": "when_deleted:retain,when_scaled:delete"
+            }
+        }
+        k8s.update_config(patch_scaled_policy_delete)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+
+        master_nodes, replica_nodes = k8s.get_cluster_nodes()
+        self.assertNotEqual(master_nodes, [])
+        self.assertNotEqual(replica_nodes, [])
+
+        # Patch label to nodes for topologySpreadConstraints
+        patch_node_label = {
+            "metadata": {
+                "labels": {
+                    "topology.kubernetes.io/zone": "zalando"
+                }
+            }
+        }
+        k8s.api.core_v1.patch_node(master_nodes[0], patch_node_label)
+        k8s.api.core_v1.patch_node(replica_nodes[0], patch_node_label)
+
+        # Patch topologySpreadConstraint and scale-out postgresql pods to postgresqls manifest.
+        patch_topologySpreadConstraint_config = {
+            "spec": {
+                "numberOfInstances": 6,
+                "topologySpreadConstraint": [
+                    {
+                        "maxskew": 1,
+                        "topologyKey": "topology.kubernetes.io/zone",
+                        "whenUnsatisfiable": "DoNotSchedule"
+                    }
+                ]
+            }
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default",
+            "postgresqls", "acid-minimal-cluster",
+            patch_topologySpreadConstraint_config)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+        self.eventuallyEqual(lambda: k8s.count_pods_with_label(cluster_labels), 6, "Postgresql StatefulSet are scale to 6")
+        self.eventuallyEqual(lambda: k8s.count_running_pods(), 6, "All pods are running")
+
+        worker_node_1 = 0
+        worker_node_2 = 0
+        pods = k8s.api.core_v1.list_namespaced_pod('default', label_selector=cluster_labels)
+        for pod in pods.items:
+            if pod.spec.node_name == 'postgres-operator-e2e-tests-worker':
+                worker_node_1 += 1
+            elif pod.spec.node_name == 'postgres-operator-e2e-tests-worker2':
+                worker_node_2 += 1
+
+        self.assertEqual(worker_node_1, worker_node_2)
+        self.assertEqual(worker_node_1, 3)
+        self.assertEqual(worker_node_2, 3)
+
+        # Reset configurations
+        patch_topologySpreadConstraint_config = {
+            "spec": {
+                "numberOfInstances": 2,
+                "topologySpreadConstraint": []
+            }
+        }
+        k8s.api.custom_objects_api.patch_namespaced_custom_object(
+            "acid.zalan.do", "v1", "default",
+            "postgresqls", "acid-minimal-cluster",
+            patch_topologySpreadConstraint_config)
+        self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
+        self.eventuallyEqual(lambda: k8s.count_pods_with_label(cluster_labels), 2, "Postgresql StatefulSet are scale to 2")
+        self.eventuallyEqual(lambda: k8s.count_running_pods(), 2, "All pods are running")
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
     def test_zz_cluster_deletion(self):
@@ -2261,7 +2544,7 @@ class EndToEndTestCase(unittest.TestCase):
             self.eventuallyEqual(lambda: k8s.count_deployments_with_label(cluster_label), 0, "Deployments not deleted")
             self.eventuallyEqual(lambda: k8s.count_pdbs_with_label(cluster_label), 0, "Pod disruption budget not deleted")
             self.eventuallyEqual(lambda: k8s.count_secrets_with_label(cluster_label), 8, "Secrets were deleted although disabled in config")
-            self.eventuallyEqual(lambda: k8s.count_pvcs_with_label(cluster_label), 3, "PVCs were deleted although disabled in config")
+            self.eventuallyEqual(lambda: k8s.count_pvcs_with_label(cluster_label), 2, "PVCs were deleted although disabled in config")
 
         except timeout_decorator.TimeoutError:
             print('Operator log: {}'.format(k8s.get_operator_log()))
@@ -2303,7 +2586,7 @@ class EndToEndTestCase(unittest.TestCase):
 
         # if nodes are different we can quit here
         if master_nodes[0] not in replica_nodes:
-            return True             
+            return True
 
         # enable pod anti affintiy in config map which should trigger movement of replica
         patch_enable_antiaffinity = {
@@ -2327,7 +2610,7 @@ class EndToEndTestCase(unittest.TestCase):
             }
             k8s.update_config(patch_disable_antiaffinity, "disable antiaffinity")
             self.eventuallyEqual(lambda: k8s.get_operator_state(), {"0": "idle"}, "Operator does not get in sync")
-            
+
             k8s.wait_for_pod_start('spilo-role=replica,' + cluster_labels)
             k8s.wait_for_running_pods(cluster_labels, 2)
 
@@ -2338,7 +2621,7 @@ class EndToEndTestCase(unittest.TestCase):
             # if nodes are different we can quit here
             for target_node in target_nodes:
                 if (target_node not in master_nodes or target_node not in replica_nodes) and master_nodes[0] in replica_nodes:
-                    print('Pods run on the same node') 
+                    print('Pods run on the same node')
                     return False
 
         except timeout_decorator.TimeoutError:
@@ -2346,6 +2629,46 @@ class EndToEndTestCase(unittest.TestCase):
             raise
 
         return True
+
+    def check_cluster_child_resources_owner_references(self, cluster_name, cluster_namespace='default', inverse=False):
+        k8s = self.k8s
+
+        # check if child resources were updated with owner references
+        sset = k8s.api.apps_v1.read_namespaced_stateful_set(cluster_name, cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(sset.metadata.owner_references, inverse), "statefulset owner reference check failed")
+
+        svc = k8s.api.core_v1.read_namespaced_service(cluster_name, cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(svc.metadata.owner_references, inverse), "primary service owner reference check failed")
+        replica_svc = k8s.api.core_v1.read_namespaced_service(cluster_name + "-repl", cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(replica_svc.metadata.owner_references, inverse), "replica service owner reference check failed")
+        config_svc = k8s.api.core_v1.read_namespaced_service(cluster_name + "-config", cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(config_svc.metadata.owner_references, inverse), "config service owner reference check failed")
+
+        ep = k8s.api.core_v1.read_namespaced_endpoints(cluster_name, cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(ep.metadata.owner_references, inverse), "primary endpoint owner reference check failed")
+        replica_ep = k8s.api.core_v1.read_namespaced_endpoints(cluster_name + "-repl", cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(replica_ep.metadata.owner_references, inverse), "replica endpoint owner reference check failed")
+        config_ep = k8s.api.core_v1.read_namespaced_endpoints(cluster_name + "-config", cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(config_ep.metadata.owner_references, inverse), "config endpoint owner reference check failed")
+
+        pdb = k8s.api.policy_v1.read_namespaced_pod_disruption_budget("postgres-{}-pdb".format(cluster_name), cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(pdb.metadata.owner_references, inverse), "primary pod disruption budget owner reference check failed")
+
+        pdb = k8s.api.policy_v1.read_namespaced_pod_disruption_budget("postgres-{}-critical-op-pdb".format(cluster_name), cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(pdb.metadata.owner_references, inverse), "pod disruption budget for critical operations owner reference check failed")
+
+        pg_secret = k8s.api.core_v1.read_namespaced_secret("postgres.{}.credentials.postgresql.acid.zalan.do".format(cluster_name), cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(pg_secret.metadata.owner_references, inverse), "postgres secret owner reference check failed")
+        standby_secret = k8s.api.core_v1.read_namespaced_secret("standby.{}.credentials.postgresql.acid.zalan.do".format(cluster_name), cluster_namespace)
+        self.assertTrue(self.has_postgresql_owner_reference(standby_secret.metadata.owner_references, inverse), "standby secret owner reference check failed")
+
+        return True
+
+    def has_postgresql_owner_reference(self, owner_references, inverse):
+        if inverse:
+            return owner_references is None or owner_references[0].kind != 'postgresql'
+
+        return owner_references is not None and owner_references[0].kind == 'postgresql' and owner_references[0].controller
 
     def list_databases(self, pod_name):
         '''

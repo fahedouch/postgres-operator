@@ -26,7 +26,6 @@ _testmain.go
 *.test
 *.prof
 /vendor/
-/kubectl-pg/vendor/
 /build/
 /docker/build/
 /github.com/
@@ -104,3 +103,5 @@ e2e/tls
 mocks
 
 ui/.npm/
+
+.DS_Store

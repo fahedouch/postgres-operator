@@ -9,12 +9,14 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/zalando/postgres-operator/mocks"
-	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
-	"github.com/zalando/postgres-operator/pkg/spec"
-	"github.com/zalando/postgres-operator/pkg/util/config"
-	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
-	"github.com/zalando/postgres-operator/pkg/util/patroni"
+	"github.com/zalando/postgres-operator/v2/mocks"
+	acidv1 "github.com/zalando/postgres-operator/v2/pkg/apis/acid.zalan.do/v1"
+	"github.com/zalando/postgres-operator/v2/pkg/spec"
+	"github.com/zalando/postgres-operator/v2/pkg/util/config"
+	"github.com/zalando/postgres-operator/v2/pkg/util/k8sutil"
+	"github.com/zalando/postgres-operator/v2/pkg/util/patroni"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestGetSwitchoverCandidate(t *testing.T) {
@@ -27,8 +29,8 @@ func TestGetSwitchoverCandidate(t *testing.T) {
 	var cluster = New(
 		Config{
 			OpConfig: config.Config{
-				PatroniAPICheckInterval: time.Duration(1),
-				PatroniAPICheckTimeout:  time.Duration(5),
+				PatroniAPICheckInterval: &metav1.Duration{Duration: 1 * time.Second},
+				PatroniAPICheckTimeout:  &metav1.Duration{Duration: 5 * time.Second},
 			},
 		}, k8sutil.KubernetesClient{}, acidv1.Postgresql{}, logger, eventRecorder)
 
@@ -62,7 +64,7 @@ func TestGetSwitchoverCandidate(t *testing.T) {
 			expectedError:     nil,
 		},
 		{
-			subtest:           "choose first replica when lag is equal evrywhere",
+			subtest:           "choose first replica when lag is equal everywhere",
 			clusterJson:       `{"members": [{"name": "acid-test-cluster-0", "role": "leader", "state": "running", "api_url": "http://192.168.100.1:8008/patroni", "host": "192.168.100.1", "port": 5432, "timeline": 1}, {"name": "acid-test-cluster-1", "role": "replica", "state": "streaming", "api_url": "http://192.168.100.2:8008/patroni", "host": "192.168.100.2", "port": 5432, "timeline": 1, "lag": 5}, {"name": "acid-test-cluster-2", "role": "replica", "state": "running", "api_url": "http://192.168.100.3:8008/patroni", "host": "192.168.100.3", "port": 5432, "timeline": 1, "lag": 5}]}`,
 			syncModeEnabled:   false,
 			expectedCandidate: spec.NamespacedName{Namespace: namespace, Name: "acid-test-cluster-1"},
@@ -73,7 +75,7 @@ func TestGetSwitchoverCandidate(t *testing.T) {
 			clusterJson:       `{"members": [{"name": "acid-test-cluster-0", "role": "leader", "state": "running", "api_url": "http://192.168.100.1:8008/patroni", "host": "192.168.100.1", "port": 5432, "timeline": 2}, {"name": "acid-test-cluster-1", "role": "replica", "state": "starting", "api_url": "http://192.168.100.2:8008/patroni", "host": "192.168.100.2", "port": 5432, "timeline": 2}]}`,
 			syncModeEnabled:   false,
 			expectedCandidate: spec.NamespacedName{},
-			expectedError:     fmt.Errorf("no switchover candidate found"),
+			expectedError:     fmt.Errorf("failed to get Patroni cluster members: unexpected end of JSON input"),
 		},
 		{
 			subtest:           "replicas with different status",
@@ -110,5 +112,304 @@ func TestGetSwitchoverCandidate(t *testing.T) {
 		if candidate != tt.expectedCandidate {
 			t.Errorf("%s - %s: unexpect switchover candidate, got %s, expected %s", testName, tt.subtest, candidate, tt.expectedCandidate)
 		}
+	}
+}
+
+func TestPodIsNotRunning(t *testing.T) {
+	tests := []struct {
+		subtest  string
+		pod      v1.Pod
+		expected bool
+	}{
+		{
+			subtest: "pod with no status reported yet",
+			pod: v1.Pod{
+				Status: v1.PodStatus{},
+			},
+			expected: false,
+		},
+		{
+			subtest: "pod running with all containers ready",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			subtest: "pod in pending phase",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodPending,
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod running but container in CreateContainerConfigError",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Waiting: &v1.ContainerStateWaiting{
+									Reason:  "CreateContainerConfigError",
+									Message: `secret "some-secret" not found`,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod running but container in CrashLoopBackOff",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Waiting: &v1.ContainerStateWaiting{
+									Reason: "CrashLoopBackOff",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod running but container terminated",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Terminated: &v1.ContainerStateTerminated{
+									ExitCode: 137,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod running with mixed container states - one healthy one broken",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{},
+							},
+						},
+						{
+							State: v1.ContainerState{
+								Waiting: &v1.ContainerStateWaiting{
+									Reason: "CreateContainerConfigError",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod in failed phase",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodFailed,
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "pod running with multiple healthy containers",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{},
+							},
+						},
+						{
+							State: v1.ContainerState{
+								Running: &v1.ContainerStateRunning{},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			subtest: "pod running with ImagePullBackOff",
+			pod: v1.Pod{
+				Status: v1.PodStatus{
+					Phase: v1.PodRunning,
+					ContainerStatuses: []v1.ContainerStatus{
+						{
+							State: v1.ContainerState{
+								Waiting: &v1.ContainerStateWaiting{
+									Reason: "ImagePullBackOff",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.subtest, func(t *testing.T) {
+			result := podIsNotRunning(&tt.pod)
+			if result != tt.expected {
+				t.Errorf("podIsNotRunning() = %v, expected %v", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAllPodsRunning(t *testing.T) {
+	client, _ := newFakeK8sSyncClient()
+
+	var cluster = New(
+		Config{
+			OpConfig: config.Config{
+				Resources: config.Resources{
+					ClusterLabels:    map[string]string{"application": "spilo"},
+					ClusterNameLabel: "cluster-name",
+					PodRoleLabel:     "spilo-role",
+				},
+			},
+		}, client, acidv1.Postgresql{}, logger, eventRecorder)
+
+	tests := []struct {
+		subtest  string
+		pods     []v1.Pod
+		expected bool
+	}{
+		{
+			subtest: "all pods running",
+			pods: []v1.Pod{
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+						},
+					},
+				},
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			subtest: "one pod not running",
+			pods: []v1.Pod{
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{State: v1.ContainerState{Running: &v1.ContainerStateRunning{}}},
+						},
+					},
+				},
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{
+								State: v1.ContainerState{
+									Waiting: &v1.ContainerStateWaiting{
+										Reason: "CreateContainerConfigError",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			subtest: "all pods not running",
+			pods: []v1.Pod{
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodPending,
+					},
+				},
+				{
+					Status: v1.PodStatus{
+						Phase: v1.PodRunning,
+						ContainerStatuses: []v1.ContainerStatus{
+							{
+								State: v1.ContainerState{
+									Waiting: &v1.ContainerStateWaiting{
+										Reason: "CrashLoopBackOff",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			subtest:  "empty pod list",
+			pods:     []v1.Pod{},
+			expected: true,
+		},
+		{
+			subtest: "pods with no status reported yet",
+			pods: []v1.Pod{
+				{
+					Status: v1.PodStatus{},
+				},
+				{
+					Status: v1.PodStatus{},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.subtest, func(t *testing.T) {
+			result := cluster.allPodsRunning(tt.pods)
+			if result != tt.expected {
+				t.Errorf("allPodsRunning() = %v, expected %v", result, tt.expected)
+			}
+		})
 	}
 }

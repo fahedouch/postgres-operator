@@ -7,9 +7,9 @@ import (
 
 	"reflect"
 
-	"github.com/zalando/postgres-operator/pkg/spec"
-	"github.com/zalando/postgres-operator/pkg/util"
-	"github.com/zalando/postgres-operator/pkg/util/constants"
+	"github.com/zalando/postgres-operator/v2/pkg/spec"
+	"github.com/zalando/postgres-operator/v2/pkg/util"
+	"github.com/zalando/postgres-operator/v2/pkg/util/constants"
 )
 
 const (
@@ -24,7 +24,7 @@ const (
 	doBlockStmt          = `SET LOCAL synchronous_commit = 'local'; DO $$ BEGIN %s; END;$$;`
 	passwordTemplate     = "ENCRYPTED PASSWORD '%s'"
 	inRoleTemplate       = `IN ROLE %s`
-	adminTemplate        = `ADMIN %s`
+	adminTemplate        = `ADMIN "%s"`
 )
 
 // DefaultUserSyncStrategy implements a user sync strategy that merges already existing database users
@@ -48,6 +48,10 @@ func (strategy DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserM
 		if newUser.Deleted {
 			continue
 		}
+		// when the secret of the user could not be created or updated skip any database actions
+		if newUser.Degraded {
+			continue
+		}
 		dbUser, exists := dbUsers[name]
 		if !exists {
 			reqs = append(reqs, spec.PgSyncUserRequest{Kind: spec.PGSyncUserAdd, User: newUser})
@@ -56,11 +60,13 @@ func (strategy DefaultUserSyncStrategy) ProduceSyncRequests(dbUsers spec.PgUserM
 			}
 		} else {
 			r := spec.PgSyncUserRequest{}
-			newMD5Password := util.NewEncryptor(strategy.PasswordEncryption).PGUserPassword(newUser)
 
-			// do not compare for roles coming from docker image
-			if dbUser.Password != newMD5Password {
-				r.User.Password = newMD5Password
+			// A plain string comparison with a freshly generated hash would
+			// re-issue ALTER ROLE on every sync for SCRAM-SHA-256, because
+			// each generated verifier embeds a new random salt. Verify the
+			// stored hash against the desired password instead.
+			if !util.PGUserPasswordUpToDate(newUser, dbUser.Password, strategy.PasswordEncryption) {
+				r.User.Password = util.NewEncryptor(strategy.PasswordEncryption).PGUserPassword(newUser)
 				r.Kind = spec.PGsyncUserAlter
 			}
 			if addNewRoles, equal := util.SubstractStringSlices(newUser.MemberOf, dbUser.MemberOf); !equal {

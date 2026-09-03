@@ -42,14 +42,14 @@ and change it.
 
 To test the CRD-based configuration locally, use the following
 
-```bash
-  kubectl create -f manifests/operatorconfiguration.crd.yaml # registers the CRD
-  kubectl create -f manifests/postgresql-operator-default-configuration.yaml
+```
+kubectl create -f manifests/operatorconfiguration.crd.yaml # registers the CRD
+kubectl create -f manifests/postgresql-operator-default-configuration.yaml
 
-  kubectl create -f manifests/operator-service-account-rbac.yaml
-  kubectl create -f manifests/postgres-operator.yaml # set the env var as mentioned above
+kubectl create -f manifests/operator-service-account-rbac.yaml
+kubectl create -f manifests/postgres-operator.yaml # set the env var as mentioned above
 
-  kubectl get operatorconfigurations postgresql-operator-default-configuration -o yaml
+kubectl get operatorconfigurations postgresql-operator-default-configuration -o yaml
 ```
 
 The CRD-based configuration is more powerful than the one based on ConfigMaps
@@ -79,11 +79,6 @@ Those are top-level keys, containing both leaf keys and groups.
   Instruct the operator to create/update the CRDs. If disabled the operator will rely on the CRDs being managed separately.
   The default is `true`.
 
-* **enable_crd_validation**
-  *deprecated*: toggles if the operator will create or update CRDs with
-  [OpenAPI v3 schema validation](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#validation)
-  The default is `true`. `false` will be ignored, since `apiextensions.io/v1` requires a structural schema definition.
-
 * **crd_categories**
   The operator will register CRDs in the `all` category by default so that they will be returned by a `kubectl get all` call. You are free to change categories or leave them empty.
 
@@ -93,9 +88,6 @@ Those are top-level keys, containing both leaf keys and groups.
 
 * **enable_pgversion_env_var**
   With newer versions of Spilo, it is preferable to use `PGVERSION` pod environment variable instead of the setting `postgresql.bin_dir` in the `SPILO_CONFIGURATION` env variable. When this option is true, the operator sets `PGVERSION` and omits `postgresql.bin_dir` from  `SPILO_CONFIGURATION`. When false, the `postgresql.bin_dir` is set. This setting takes precedence over `PGVERSION`; see PR 222 in Spilo. The default is `true`.
-
-* **enable_spilo_wal_path_compat**
-  enables backwards compatible path between Spilo 12 and Spilo 13+ images. The default is `false`.
 
 * **enable_team_id_clustername_prefix**
   To lower the risk of name clashes between clusters of different teams you
@@ -108,10 +100,13 @@ Those are top-level keys, containing both leaf keys and groups.
   Kubernetes-native DCS).
 
 * **kubernetes_use_configmaps**
-  Select if setup uses endpoints (default), or configmaps to manage leader when
+  Select if setup uses endpoints or configmaps (default) to manage leader when
   DCS is kubernetes (not etcd or similar). In OpenShift it is not possible to
-  use endpoints option, and configmaps is required. By default,
-  `kubernetes_use_configmaps: false`, meaning endpoints will be used.
+  use endpoints option, and configmaps is required. Starting with K8s 1.33,
+  endpoints are marked as deprecated. It's recommended to switch to config maps
+  instead. But, to do so make sure you scale the Postgres cluster down to just
+  one primary pod (e.g. using `max_instances` option). Otherwise, you risk
+  running into a split-brain scenario. Default is `true`.
 
 * **docker_image**
   Spilo Docker image for Postgres instances. For production, don't rely on the
@@ -161,7 +156,26 @@ Those are top-level keys, containing both leaf keys and groups.
   for some clusters it might be required to scale beyond the limits that can be
   configured with `min_instances` and `max_instances` options. You can define
   an annotation key that can be used as a toggle in cluster manifests to ignore
-  globally configured instance limits. The default is empty.
+  globally configured instance limits. The value must be `"true"` to be
+  effective. The default is empty which means the feature is disabled.
+
+* **ignore_resources_limits_annotation_key**
+  for some clusters it might be required to request resources beyond the globally
+  configured thresholds for maximum requests and minimum limits. You can define
+  an annotation key that can be used as a toggle in cluster manifests to ignore
+  the thresholds. The value must be `"true"` to be effective. The default is empty
+  which means the feature is disabled.
+
+* **enable_maintenance_windows**
+  toggle for using the maintenance windows feature. Default is `"true"`.
+
+* **maintenance_windows**
+  a list which defines specific time frames when certain maintenance
+  operations such as automatic major upgrades or master pod migration are
+  allowed to happen for all database clusters. Accepted formats are
+  "01:00-06:00" for daily maintenance windows or "Sat:00:00-04:00" for
+  specific days, with all times in UTC. Locally defined maintenance
+  windows take precedence over globally configured ones.
 
 * **resync_period**
   period between consecutive sync requests. The default is `30m`.
@@ -212,7 +226,7 @@ under the `users` key.
   For all `LOGIN` roles that are not database owners the operator can rotate
   credentials in the corresponding K8s secrets by replacing the username and
   password. This means, new users will be added on each rotation inheriting
-  all priviliges from the original roles. The rotation date (in YYMMDD format)
+  all privileges from the original roles. The rotation date (in YYMMDD format)
   is appended to the names of the new user. The timestamp of the next rotation
   is written to the secret. The default is `false`.
 
@@ -242,7 +256,7 @@ CRD-configuration, they are grouped under the `major_version_upgrade` key.
   `"manual"` = manifest triggers action,
   `"full"` = manifest and minimal version violation trigger upgrade.
   Note, that with all three modes increasing the version in the manifest will
-  trigger a rolling update of the pods. The default is `"off"`.
+  trigger a rolling update of the pods. The default is `"manual"`.
 
 * **major_version_upgrade_team_allow_list**
   Upgrades will only be carried out for clusters of listed teams when mode is
@@ -250,18 +264,47 @@ CRD-configuration, they are grouped under the `major_version_upgrade` key.
 
 * **minimal_major_version**
   The minimal Postgres major version that will not automatically be upgraded
-  when `major_version_upgrade_mode` is set to `"full"`. The default is `"12"`.
+  when `major_version_upgrade_mode` is set to `"full"`. The default is `"14"`.
 
 * **target_major_version**
   The target Postgres major version when upgrading clusters automatically
   which violate the configured allowed `minimal_major_version` when
-  `major_version_upgrade_mode` is set to `"full"`. The default is `"16"`.
+  `major_version_upgrade_mode` is set to `"full"`. The default is `"18"`.
 
 ## Kubernetes resources
 
 Parameters to configure cluster-related Kubernetes objects created by the
 operator, as well as some timeouts associated with them. In a CRD-based
 configuration they are grouped under the `kubernetes` key.
+
+* **enable_finalizers**
+  By default, a deletion of the Postgresql resource will trigger an event
+  that leads to a cleanup of all child resources. However, if the database
+  cluster is in a broken state (e.g. failed initialization) and the operator
+  cannot fully sync it, there can be leftovers. By enabling finalizers the
+  operator will ensure all managed resources are deleted prior to the
+  Postgresql resource. See also [admin docs](../administrator.md#owner-references-and-finalizers)
+  for more information The default is `false`.
+
+* **enable_owner_references**
+  The operator can set owner references on its child resources (except PVCs,
+  Patroni config service/endpoint, cross-namespace secrets) to improve cluster
+  monitoring and enable cascading deletion. User-credential secrets are also
+  excluded from controller owner references whenever
+  [enable_secrets_deletion](#enable_secrets_deletion) is `false`, so that
+  Kubernetes garbage collection does not cascade-delete them when the
+  Postgresql resource is removed. The default is `false`. Warning, enabling
+  this option disables configured delete protection checks (see below).
+
+* **delete_annotation_date_key**
+  key name for annotation that compares manifest value with current date in the
+  YYYY-MM-DD format. Allowed pattern: `'([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]'`.
+  The default is empty which also disables this delete protection check.
+
+* **delete_annotation_name_key**
+  key name for annotation that compares manifest value with Postgres cluster name.
+  Allowed pattern: `'([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]'`. The default is
+  empty which also disables this delete protection check.
 
 * **pod_service_account_name**
   service account used by Patroni running on individual Pods to communicate
@@ -288,20 +331,14 @@ configuration they are grouped under the `kubernetes` key.
   Postgres pods are [terminated forcefully](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
   after this timeout. The default is `5m`.
 
+* **liveness_probe**
+  Allows for adding a liveness probe to the Spilo container to detect if it's
+  running properly. Cannot be configured via ConfigMap. Default is empty.
+
 * **custom_pod_annotations**
   This key/value map provides a list of annotations that get attached to each pod
   of a database created by the operator. If the annotation key is also provided
   by the database definition, the database definition value is used.
-
-* **delete_annotation_date_key**
-  key name for annotation that compares manifest value with current date in the
-  YYYY-MM-DD format. Allowed pattern: `'([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]'`.
-  The default is empty which also disables this delete protection check.
-
-* **delete_annotation_name_key**
-  key name for annotation that compares manifest value with Postgres cluster name.
-  Allowed pattern: `'([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]'`. The default is
-  empty which also disables this delete protection check.
 
 * **downscaler_annotations**
   An array of annotations that should be passed from Postgres CRD on to the
@@ -322,29 +359,15 @@ configuration they are grouped under the `kubernetes` key.
   pod namespace).
 
 * **pdb_name_format**
-  defines the template for PDB (Pod Disruption Budget) names created by the
+  defines the template for primary PDB (Pod Disruption Budget) name created by the
   operator. The default is `postgres-{cluster}-pdb`, where `{cluster}` is
   replaced by the cluster name. Only the `{cluster}` placeholders is allowed in
   the template.
 
 * **pdb_master_label_selector**
-  By default the PDB will match the master role hence preventing nodes to be
+  By default the primary PDB will match the master role hence preventing nodes to be
   drained if the node_readiness_label is not used. If this option if set to
   `false` the `spilo-role=master` selector will not be added to the PDB.
-
-* **enable_finalizers**
-  By default, a deletion of the Postgresql resource will trigger an event
-  that leads to a cleanup of all child resources. However, if the database
-  cluster is in a broken state (e.g. failed initialization) and the operator
-  cannot fully sync it, there can be leftovers. By enabling finalizers the
-  operator will ensure all managed resources are deleted prior to the
-  Postgresql resource. There is a trade-off though: The deletion is only
-  performed after the next two SYNC cycles with the first one updating the
-  internal spec and the latter reacting on the `deletionTimestamp` while
-  processing the SYNC event. The final removal of the custom resource will
-  add a DELETE event to the worker queue but the child resources are already
-  gone at this point.
-  The default is `false`.
 
 * **persistent_volume_claim_retention_policy**
   The operator tries to protect volumes as much as possible. If somebody
@@ -362,10 +385,18 @@ configuration they are grouped under the `kubernetes` key.
 
 * **enable_secrets_deletion**
   By default, the operator deletes secrets when removing the Postgres cluster
-  manifest. To keep secrets, set this option to `false`. The default is `true`.
+  manifest. To keep secrets, set this option to `false`. Note that this only
+  guards the operator's own deletion logic; Kubernetes garbage collection can
+  still remove user-credential secrets when
+  [enable_owner_references](#enable_owner_references) is `true` because the
+  Postgresql resource acts as a controller owner. To prevent that, the
+  operator skips the controller owner reference on user-credential secrets
+  whenever `enable_secrets_deletion` is `false`, so the two settings work
+  together. This protection takes effect on the cluster's next sync after
+  the setting is applied. The default is `true`.
 
 * **enable_persistent_volume_claim_deletion**
-  By default, the operator deletes PersistentVolumeClaims when removing the
+  By default, the operator deletes persistent volume claims when removing the
   Postgres cluster manifest, no matter if `persistent_volume_claim_retention_policy`
   on the statefulset is set to `retain`. To keep PVCs set this option to `false`.
   The default is `true`.
@@ -554,7 +585,7 @@ configuration they are grouped under the `kubernetes` key.
   pods with `InitialDelaySeconds: 6`, `PeriodSeconds: 10`, `TimeoutSeconds: 5`,
   `SuccessThreshold: 1` and `FailureThreshold: 3`. When enabling readiness
   probes it is recommended to switch the `pod_management_policy` to `parallel`
-  to avoid unneccesary waiting times in case of multiple instances failing.
+  to avoid unnecessary waiting times in case of multiple instances failing.
   The default is `false`.
 
 * **storage_resize_mode**
@@ -563,7 +594,7 @@ configuration they are grouped under the `kubernetes` key.
     1. `ebs`   : operator resizes EBS volumes directly and executes `resizefs` within a pod
     2. `pvc`   : operator only changes PVC definition
     3. `off`   : disables resize of the volumes.
-    4. `mixed` : operator uses AWS API to adjust size, throughput, and IOPS, and calls pvc change for file system resize
+    4. `mixed` : operator uses AWS API to adjust size, type, throughput, and IOPS, and calls pvc change for file system resize
     Default is "pvc".
 
 ## Kubernetes resource requests
@@ -703,7 +734,7 @@ In the CRD-based configuration they are grouped under the `load_balancer` key.
   replaced by the cluster name, `{namespace}` is replaced with the namespace
   and `{hostedzone}` is replaced with the hosted zone (the value of the
   `db_hosted_zone` parameter). The `{team}` placeholder can still be used,
-  although it is not recommened because the team of a cluster can change.
+  although it is not recommended because the team of a cluster can change.
   If the cluster name starts with the `teamId` it will also be part of the
   DNS, aynway. No other placeholders are allowed!
 
@@ -722,7 +753,7 @@ In the CRD-based configuration they are grouped under the `load_balancer` key.
   is replaced by the cluster name, `{namespace}` is replaced with the
   namespace and `{hostedzone}` is replaced with the hosted zone (the value of
   the `db_hosted_zone` parameter). The `{team}` placeholder can still be used,
-  although it is not recommened because the team of a cluster can change.
+  although it is not recommended because the team of a cluster can change.
   If the cluster name starts with the `teamId` it will also be part of the
   DNS, aynway. No other placeholders are allowed!
 
@@ -779,6 +810,15 @@ yet officially supported.
   [kube2iam](https://github.com/jtblin/kube2iam) project on AWS. The default is
   empty.
 
+* **irsa_role_arn**
+  Full AWS IAM role ARN to supply in the `eks.amazonaws.com/role-arn` annotation
+  of the Postgres pod service account, enabling
+  [IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+  (IAM Roles for Service Accounts) on EKS. When set, the operator annotates the
+  pod service account on every sync so that the EKS OIDC webhook can inject AWS
+  credentials directly into pods. Must be a full ARN, e.g.
+  `arn:aws:iam::123456789012:role/my-postgres-role`. The default is empty.
+
 * **aws_region**
   AWS region used to store EBS volumes. The default is `eu-central-1`. Note,
   this option is not meant for specifying the AWS region for backups and
@@ -792,16 +832,6 @@ yet officially supported.
 * **additional_secret_mount_path**
   Path to mount the above Secret in the filesystem of the container(s).
   The default is empty.
-
-* **enable_ebs_gp3_migration**
-  enable automatic migration on AWS from gp2 to gp3 volumes, that are smaller
-  than the configured max size (see below). This ignores that EBS gp3 is by
-  default only 125 MB/sec vs 250 MB/sec for gp2 >= 333GB.
-  The default is `false`.
-
-* **enable_ebs_gp3_migration_max_size**
-  defines the maximum volume size in GB until which auto migration happens.
-  Default is 1000 (1TB) which matches 3000 IOPS.
 
 ## Logical backup
 
@@ -821,7 +851,7 @@ grouped under the `logical_backup` key.
   runs `pg_dumpall` on a replica if possible and uploads compressed results to
   an S3 bucket under the key `/<configured-s3-bucket-prefix>/<pg_cluster_name>/<cluster_k8s_uuid>/logical_backups`.
   The default image is the same image built with the Zalando-internal CI
-  pipeline. Default: "ghcr.io/zalando/postgres-operator/logical-backup:v1.12.2"
+  pipeline. Default: "ghcr.io/zalando/postgres-operator/logical-backup:v2.0.2"
 
 * **logical_backup_google_application_credentials**
   Specifies the path of the google cloud service account json file. Default is empty.
@@ -877,6 +907,28 @@ grouped under the `logical_backup` key.
 
 * **logical_backup_cronjob_environment_secret**
   Reference to a Kubernetes secret, which keys will be added as environment variables to the cronjob. Default: ""
+
+* **logical_backup_successful_jobs_history_limit**
+  number of successful backup jobs to keep in cronjob history. The default is `3`.
+
+* **logical_backup_failed_jobs_history_limit**
+  number of failed backup jobs to keep in cronjob history. The default is `3`.
+
+* **logical_backup_ttl_seconds_after_finished**
+  TTL in seconds after which finished backup jobs are automatically deleted. The default is `86400`.
+
+The following environment variables can be passed to the logical backup
+cronjob via `logical_backup_cronjob_environment_secret` to control
+connectivity checks before the backup starts:
+
+* **LOGICAL_BACKUP_CONNECT_RETRIES**
+  Number of times to retry connecting to the target PostgreSQL pod before
+  giving up. This is useful when NetworkPolicy enforcement introduces a
+  short delay before a newly-created pod's IP is allowed through ingress
+  rules on the destination node. Default: "10"
+
+* **LOGICAL_BACKUP_CONNECT_RETRY_DELAY**
+  Delay in seconds between connectivity retries. Default: "2"
 
 ## Debugging the operator
 
@@ -1040,7 +1092,7 @@ operator being able to provide some reasonable defaults.
 
 * **connection_pooler_image**
   Docker image to use for connection pooler deployment.
-  Default: "registry.opensource.zalan.do/acid/pgbouncer"
+  Default: "ghcr.io/zalando/postgres-operator/pgbouncer:v2.0.2"
 
 * **connection_pooler_max_db_connections**
   How many connections the pooler can max hold. This value is divided among the

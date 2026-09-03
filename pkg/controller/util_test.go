@@ -8,9 +8,9 @@ import (
 	b64 "encoding/base64"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/zalando/postgres-operator/pkg/spec"
-	"github.com/zalando/postgres-operator/pkg/util/config"
-	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
+	"github.com/zalando/postgres-operator/v2/pkg/spec"
+	"github.com/zalando/postgres-operator/v2/pkg/util/config"
+	"github.com/zalando/postgres-operator/v2/pkg/util/k8sutil"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -132,7 +132,7 @@ func TestOldInfrastructureRoleFormat(t *testing.T) {
 	for _, test := range testTable {
 		roles, err := utilTestController.getInfrastructureRoles(
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName:  test.secretName,
 					UserKey:     "user",
 					PasswordKey: "password",
@@ -163,7 +163,7 @@ func TestNewInfrastructureRoleFormat(t *testing.T) {
 		// one secret with one configmap
 		{
 			[]spec.NamespacedName{
-				spec.NamespacedName{
+				{
 					Namespace: v1.NamespaceDefault,
 					Name:      testInfrastructureRolesNewSecretName,
 				},
@@ -187,11 +187,11 @@ func TestNewInfrastructureRoleFormat(t *testing.T) {
 		// multiple standalone secrets
 		{
 			[]spec.NamespacedName{
-				spec.NamespacedName{
+				{
 					Namespace: v1.NamespaceDefault,
 					Name:      "infrastructureroles-new-test1",
 				},
-				spec.NamespacedName{
+				{
 					Namespace: v1.NamespaceDefault,
 					Name:      "infrastructureroles-new-test2",
 				},
@@ -248,7 +248,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 		// only new CRD format
 		{
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -262,7 +262,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			spec.NamespacedName{},
 			"",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -280,7 +280,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			spec.NamespacedName{},
 			"secretname: infrastructureroles-new-test, userkey: test-user, passwordkey: test-password, rolekey: test-role",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -298,7 +298,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			spec.NamespacedName{},
 			"secretname: infrastructureroles-new-test, userkey: test-user, passwordkey: test-password, defaultrolevalue: test-role",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -319,7 +319,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			},
 			"",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesOldSecretName,
@@ -334,7 +334,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 		// both formats for CRD
 		{
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -351,7 +351,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			},
 			"",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -361,7 +361,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 					RoleKey:     "test-role",
 					Template:    false,
 				},
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesOldSecretName,
@@ -382,7 +382,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 			},
 			"secretname: infrastructureroles-new-test, userkey: test-user, passwordkey: test-password, rolekey: test-role",
 			[]*config.InfrastructureRole{
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesNewSecretName,
@@ -392,7 +392,7 @@ func TestInfrastructureRoleDefinitions(t *testing.T) {
 					RoleKey:     "test-role",
 					Template:    false,
 				},
-				&config.InfrastructureRole{
+				{
 					SecretName: spec.NamespacedName{
 						Namespace: v1.NamespaceDefault,
 						Name:      testInfrastructureRolesOldSecretName,

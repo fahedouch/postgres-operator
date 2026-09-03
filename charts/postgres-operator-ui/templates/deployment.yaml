@@ -9,7 +9,7 @@ metadata:
   name: {{ template "postgres-operator-ui.fullname" . }}
   namespace: {{ .Release.Namespace }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ template "postgres-operator-ui.name" . }}
@@ -81,14 +81,14 @@ spec:
                   "cost_memory": 0.014375,
                   "free_iops": 3000,
                   "free_throughput": 125,
-                  "limit_iops": 16000,
-                  "limit_throughput": 1000,
+                  "limit_iops": 80000,
+                  "limit_throughput": 2000,
                   "postgresql_versions": [
+                    "18",
+                    "17",
                     "16",
                     "15",
-                    "14",
-                    "13",
-                    "12"
+                    "14"
                   ]
                 }
             {{- if .Values.extraEnvs }}

@@ -11,10 +11,10 @@ import (
 
 	"github.com/lib/pq"
 
-	"github.com/zalando/postgres-operator/pkg/spec"
-	"github.com/zalando/postgres-operator/pkg/util/constants"
-	"github.com/zalando/postgres-operator/pkg/util/retryutil"
-	"github.com/zalando/postgres-operator/pkg/util/users"
+	"github.com/zalando/postgres-operator/v2/pkg/spec"
+	"github.com/zalando/postgres-operator/v2/pkg/util/constants"
+	"github.com/zalando/postgres-operator/v2/pkg/util/retryutil"
+	"github.com/zalando/postgres-operator/v2/pkg/util/users"
 )
 
 const (
@@ -46,7 +46,7 @@ const (
 	createExtensionSQL      = `CREATE EXTENSION IF NOT EXISTS "%s" SCHEMA "%s"`
 	alterExtensionSQL       = `ALTER EXTENSION "%s" SET SCHEMA "%s"`
 
-	getPublicationsSQL = `SELECT p.pubname, string_agg(pt.schemaname || '.' || pt.tablename, ', ' ORDER BY pt.schemaname, pt.tablename)
+	getPublicationsSQL = `SELECT p.pubname, COALESCE(string_agg(pt.schemaname || '.' || pt.tablename, ', ' ORDER BY pt.schemaname, pt.tablename), '') AS pubtables
 	        FROM pg_publication p
 			LEFT JOIN pg_publication_tables pt ON pt.pubname = p.pubname
 			WHERE p.pubowner = 'postgres'::regrole
@@ -111,7 +111,7 @@ func (c *Cluster) pgConnectionString(dbname string) string {
 
 func (c *Cluster) databaseAccessDisabled() bool {
 	if !c.OpConfig.EnableDBAccess {
-		c.logger.Debugf("database access is disabled")
+		c.logger.Debug("database access is disabled")
 	}
 
 	return !c.OpConfig.EnableDBAccess
@@ -281,9 +281,23 @@ func findUsersFromRotation(rotatedUsers []string, db *sql.DB) (map[string]string
 	return extraUsers, nil
 }
 
-func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
+func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string) error {
 	c.setProcessName("checking for rotated users to remove from the database due to configured retention")
-	extraUsers, err := findUsersFromRotation(rotatedUsers, db)
+
+	err := c.initDbConn()
+	if err != nil {
+		return fmt.Errorf("could not init db connection: %v", err)
+	}
+	defer func() {
+		if c.connectionIsClosed() {
+			return
+		}
+		if err := c.closeDbConn(); err != nil {
+			c.logger.Errorf("could not close database connection after removing users exceeding configured retention interval: %v", err)
+		}
+	}()
+
+	extraUsers, err := findUsersFromRotation(rotatedUsers, c.pgDb)
 	if err != nil {
 		return fmt.Errorf("error when querying for deprecated users from password rotation: %v", err)
 	}
@@ -304,7 +318,7 @@ func (c *Cluster) cleanupRotatedUsers(rotatedUsers []string, db *sql.DB) error {
 		}
 		if retentionDate.After(userCreationDate) {
 			c.logger.Infof("dropping user %q due to configured days in password_rotation_user_retention", rotatedUser)
-			if err = users.DropPgUser(rotatedUser, db); err != nil {
+			if err = users.DropPgUser(rotatedUser, c.pgDb); err != nil {
 				c.logger.Errorf("could not drop role %q: %v", rotatedUser, err)
 				continue
 			}

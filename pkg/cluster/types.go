@@ -3,7 +3,7 @@ package cluster
 import (
 	"time"
 
-	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
+	acidv1 "github.com/zalando/postgres-operator/v2/pkg/apis/acid.zalan.do/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -17,6 +17,7 @@ const (
 	// spilo roles
 	Master  PostgresRole = "master"
 	Replica PostgresRole = "replica"
+	Patroni PostgresRole = "config"
 
 	// roles returned by Patroni cluster endpoint
 	Leader        PostgresRole = "leader"
@@ -57,15 +58,16 @@ type WorkerStatus struct {
 
 // ClusterStatus describes status of the cluster
 type ClusterStatus struct {
-	Team                string
-	Cluster             string
-	Namespace           string
-	MasterService       *v1.Service
-	ReplicaService      *v1.Service
-	MasterEndpoint      *v1.Endpoints
-	ReplicaEndpoint     *v1.Endpoints
-	StatefulSet         *appsv1.StatefulSet
-	PodDisruptionBudget *policyv1.PodDisruptionBudget
+	Team                          string
+	Cluster                       string
+	Namespace                     string
+	MasterService                 *v1.Service
+	ReplicaService                *v1.Service
+	MasterEndpoint                *v1.Endpoints
+	ReplicaEndpoint               *v1.Endpoints
+	StatefulSet                   *appsv1.StatefulSet
+	PrimaryPodDisruptionBudget    *policyv1.PodDisruptionBudget
+	CriticalOpPodDisruptionBudget *policyv1.PodDisruptionBudget
 
 	CurrentProcess Process
 	Worker         uint32

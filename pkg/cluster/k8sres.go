@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 
@@ -12,27 +14,24 @@ import (
 	"github.com/sirupsen/logrus"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
-	batchv1 "k8s.io/api/batch/v1"
-	"k8s.io/apimachinery/pkg/labels"
-
-	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
-	"github.com/zalando/postgres-operator/pkg/spec"
-	"github.com/zalando/postgres-operator/pkg/util"
-	"github.com/zalando/postgres-operator/pkg/util/config"
-	"github.com/zalando/postgres-operator/pkg/util/constants"
-	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
-	"github.com/zalando/postgres-operator/pkg/util/patroni"
-	"github.com/zalando/postgres-operator/pkg/util/retryutil"
+	acidv1 "github.com/zalando/postgres-operator/v2/pkg/apis/acid.zalan.do/v1"
+	"github.com/zalando/postgres-operator/v2/pkg/spec"
+	"github.com/zalando/postgres-operator/v2/pkg/util"
+	"github.com/zalando/postgres-operator/v2/pkg/util/config"
+	"github.com/zalando/postgres-operator/v2/pkg/util/constants"
+	"github.com/zalando/postgres-operator/v2/pkg/util/k8sutil"
+	"github.com/zalando/postgres-operator/v2/pkg/util/patroni"
+	"github.com/zalando/postgres-operator/v2/pkg/util/retryutil"
 )
 
 const (
@@ -46,11 +45,6 @@ const (
 	pgPort                         = 5432
 	operatorPort                   = 8080
 )
-
-type pgUser struct {
-	Password string   `json:"password"`
-	Options  []string `json:"options"`
-}
 
 type patroniDCS struct {
 	TTL                      uint32                       `json:"ttl,omitempty"`
@@ -79,19 +73,13 @@ func (c *Cluster) statefulSetName() string {
 	return c.Name
 }
 
-func (c *Cluster) endpointName(role PostgresRole) string {
-	name := c.Name
-	if role == Replica {
-		name = fmt.Sprintf("%s-%s", name, "repl")
-	}
-
-	return name
-}
-
 func (c *Cluster) serviceName(role PostgresRole) string {
 	name := c.Name
-	if role == Replica {
+	switch role {
+	case Replica:
 		name = fmt.Sprintf("%s-%s", name, "repl")
+	case Patroni:
+		name = fmt.Sprintf("%s-%s", name, "config")
 	}
 
 	return name
@@ -120,8 +108,13 @@ func (c *Cluster) servicePort(role PostgresRole) int32 {
 	return pgPort
 }
 
-func (c *Cluster) podDisruptionBudgetName() string {
+func (c *Cluster) PrimaryPodDisruptionBudgetName() string {
 	return c.OpConfig.PDBNameFormat.Format("cluster", c.Name)
+}
+
+func (c *Cluster) criticalOpPodDisruptionBudgetName() string {
+	pdbTemplate := config.StringTemplate("postgres-{cluster}-critical-op-pdb")
+	return pdbTemplate.Format("cluster", c.Name)
 }
 
 func makeDefaultResources(config *config.Config) acidv1.Resources {
@@ -177,8 +170,8 @@ func (c *Cluster) enforceMinResourceLimits(resources *v1.ResourceRequirements) e
 		if isSmaller {
 			msg = fmt.Sprintf("defined CPU limit %s for %q container is below required minimum %s and will be increased",
 				cpuLimit.String(), constants.PostgresContainerName, minCPULimit)
-			c.logger.Warningf(msg)
-			c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "ResourceLimits", msg)
+			c.logger.Warningf("%s", msg)
+			c.eventRecorder.Event(c.GetReference(), v1.EventTypeWarning, "ResourceLimits", msg)
 			resources.Limits[v1.ResourceCPU], _ = resource.ParseQuantity(minCPULimit)
 		}
 	}
@@ -194,8 +187,8 @@ func (c *Cluster) enforceMinResourceLimits(resources *v1.ResourceRequirements) e
 		if isSmaller {
 			msg = fmt.Sprintf("defined memory limit %s for %q container is below required minimum %s and will be increased",
 				memoryLimit.String(), constants.PostgresContainerName, minMemoryLimit)
-			c.logger.Warningf(msg)
-			c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "ResourceLimits", msg)
+			c.logger.Warningf("%s", msg)
+			c.eventRecorder.Event(c.GetReference(), v1.EventTypeWarning, "ResourceLimits", msg)
 			resources.Limits[v1.ResourceMemory], _ = resource.ParseQuantity(minMemoryLimit)
 		}
 	}
@@ -320,6 +313,14 @@ func (c *Cluster) generateResourceRequirements(
 	specLimits := acidv1.ResourceDescription{}
 	result := v1.ResourceRequirements{}
 
+	enforceThresholds := true
+	resourcesLimitAnnotationKey := c.OpConfig.IgnoreResourcesLimitsAnnotationKey
+	if resourcesLimitAnnotationKey != "" {
+		if value, exists := c.ObjectMeta.Annotations[resourcesLimitAnnotationKey]; exists && value == "true" {
+			enforceThresholds = false
+		}
+	}
+
 	if resources != nil {
 		specRequests = resources.ResourceRequests
 		specLimits = resources.ResourceLimits
@@ -336,7 +337,7 @@ func (c *Cluster) generateResourceRequirements(
 	}
 
 	// enforce minimum cpu and memory limits for Postgres containers only
-	if containerName == constants.PostgresContainerName {
+	if containerName == constants.PostgresContainerName && enforceThresholds {
 		if err = c.enforceMinResourceLimits(&result); err != nil {
 			return nil, fmt.Errorf("could not enforce minimum resource limits: %v", err)
 		}
@@ -351,7 +352,7 @@ func (c *Cluster) generateResourceRequirements(
 	}
 
 	// enforce maximum cpu and memory requests for Postgres containers only
-	if containerName == constants.PostgresContainerName {
+	if containerName == constants.PostgresContainerName && enforceThresholds {
 		if err = c.enforceMaxResourceRequests(&result); err != nil {
 			return nil, fmt.Errorf("could not enforce maximum resource requests: %v", err)
 		}
@@ -365,7 +366,7 @@ func generateSpiloJSONConfiguration(pg *acidv1.PostgresqlParam, patroni *acidv1.
 
 	config.Bootstrap = pgBootstrap{}
 
-	config.Bootstrap.Initdb = []interface{}{map[string]string{"auth-host": "md5"},
+	config.Bootstrap.Initdb = []interface{}{map[string]string{"auth-host": "scram-sha-256"},
 		map[string]string{"auth-local": "trust"}}
 
 	initdbOptionNames := []string{}
@@ -419,7 +420,7 @@ PatroniInitDBParams:
 	}
 
 	if patroni.MaximumLagOnFailover >= 0 {
-		config.Bootstrap.DCS.MaximumLagOnFailover = patroni.MaximumLagOnFailover
+		config.Bootstrap.DCS.MaximumLagOnFailover = float32(patroni.MaximumLagOnFailover)
 	}
 	if patroni.LoopWait != 0 {
 		config.Bootstrap.DCS.LoopWait = patroni.LoopWait
@@ -530,13 +531,14 @@ func (c *Cluster) nodeAffinity(nodeReadinessLabel map[string]string, nodeAffinit
 				},
 			}
 		} else {
-			if c.OpConfig.NodeReadinessLabelMerge == "OR" {
+			switch c.OpConfig.NodeReadinessLabelMerge {
+			case "OR":
 				manifestTerms := nodeAffinityCopy.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
 				manifestTerms = append(manifestTerms, nodeReadinessSelectorTerm)
 				nodeAffinityCopy.RequiredDuringSchedulingIgnoredDuringExecution = &v1.NodeSelector{
 					NodeSelectorTerms: manifestTerms,
 				}
-			} else if c.OpConfig.NodeReadinessLabelMerge == "AND" {
+			case "AND":
 				for i, nodeSelectorTerm := range nodeAffinityCopy.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
 					manifestExpressions := nodeSelectorTerm.MatchExpressions
 					manifestExpressions = append(manifestExpressions, matchExpressions...)
@@ -608,6 +610,13 @@ func generatePodAntiAffinity(podAffinityTerm v1.PodAffinityTerm, preferredDuring
 	}
 
 	return podAntiAffinity
+}
+
+func generateTopologySpreadConstraints(labels labels.Set, topologySpreadConstraints []v1.TopologySpreadConstraint) []v1.TopologySpreadConstraint {
+	for _, topologySpreadConstraint := range topologySpreadConstraints {
+		topologySpreadConstraint.LabelSelector = &metav1.LabelSelector{MatchLabels: labels}
+	}
+	return topologySpreadConstraints
 }
 
 func tolerations(tolerationsSpec *[]v1.Toleration, podToleration map[string]string) []v1.Toleration {
@@ -688,6 +697,7 @@ func generateContainer(
 	dockerImage *string,
 	resourceRequirements *v1.ResourceRequirements,
 	envVars []v1.EnvVar,
+	envFrom []v1.EnvFromSource,
 	volumeMounts []v1.VolumeMount,
 	privilegedMode bool,
 	privilegeEscalationMode *bool,
@@ -714,6 +724,7 @@ func generateContainer(
 		},
 		VolumeMounts: volumeMounts,
 		Env:          envVars,
+		EnvFrom:      envFrom,
 		SecurityContext: &v1.SecurityContext{
 			AllowPrivilegeEscalation: privilegeEscalationMode,
 			Privileged:               &privilegedMode,
@@ -750,7 +761,7 @@ func (c *Cluster) generateSidecarContainers(sidecars []acidv1.Sidecar,
 }
 
 // adds common fields to sidecars
-func patchSidecarContainers(in []v1.Container, volumeMounts []v1.VolumeMount, superUserName string, credentialsSecretName string, logger *logrus.Entry) []v1.Container {
+func patchSidecarContainers(in []v1.Container, volumeMounts []v1.VolumeMount, superUserName string, credentialsSecretName string) []v1.Container {
 	result := []v1.Container{}
 
 	for _, container := range in {
@@ -815,10 +826,8 @@ func (c *Cluster) generatePodTemplate(
 	initContainers []v1.Container,
 	sidecarContainers []v1.Container,
 	sharePgSocketWithSidecars *bool,
+	topologySpreadConstraintsSpec []v1.TopologySpreadConstraint,
 	tolerationsSpec *[]v1.Toleration,
-	spiloRunAsUser *int64,
-	spiloRunAsGroup *int64,
-	spiloFSGroup *int64,
 	nodeAffinity *v1.Affinity,
 	schedulerName *string,
 	terminateGracePeriod int64,
@@ -837,18 +846,22 @@ func (c *Cluster) generatePodTemplate(
 	terminateGracePeriodSeconds := terminateGracePeriod
 	containers := []v1.Container{*spiloContainer}
 	containers = append(containers, sidecarContainers...)
-	securityContext := v1.PodSecurityContext{}
-
-	if spiloRunAsUser != nil {
-		securityContext.RunAsUser = spiloRunAsUser
+	securityContext := v1.PodSecurityContext{
+		RunAsUser:  c.OpConfig.Resources.SpiloRunAsUser,
+		RunAsGroup: c.OpConfig.Resources.SpiloRunAsGroup,
+		FSGroup:    c.OpConfig.Resources.SpiloFSGroup,
 	}
 
-	if spiloRunAsGroup != nil {
-		securityContext.RunAsGroup = spiloRunAsGroup
+	if c.Spec.SpiloRunAsUser != nil {
+		securityContext.RunAsUser = c.Spec.SpiloRunAsUser
 	}
 
-	if spiloFSGroup != nil {
-		securityContext.FSGroup = spiloFSGroup
+	if c.Spec.SpiloRunAsGroup != nil {
+		securityContext.RunAsGroup = c.Spec.SpiloRunAsGroup
+	}
+
+	if c.Spec.SpiloFSGroup != nil {
+		securityContext.FSGroup = c.Spec.SpiloFSGroup
 	}
 
 	podSpec := v1.PodSpec{
@@ -883,6 +896,8 @@ func (c *Cluster) generatePodTemplate(
 	if priorityClassName != "" {
 		podSpec.PriorityClassName = priorityClassName
 	}
+
+	podSpec.TopologySpreadConstraints = generateTopologySpreadConstraints(labels, topologySpreadConstraintsSpec)
 
 	if sharePgSocketWithSidecars != nil && *sharePgSocketWithSidecars {
 		addVarRunVolume(&podSpec)
@@ -1016,6 +1031,9 @@ func (c *Cluster) generateSpiloPodEnvVars(
 
 	if c.patroniUsesKubernetes() {
 		envVars = append(envVars, v1.EnvVar{Name: "DCS_ENABLE_KUBERNETES_API", Value: "true"})
+		if c.OpConfig.EnablePodDisruptionBudget != nil && *c.OpConfig.EnablePodDisruptionBudget {
+			envVars = append(envVars, v1.EnvVar{Name: "KUBERNETES_BOOTSTRAP_LABELS", Value: "{\"critical-operation\":\"true\"}"})
+		}
 	} else {
 		envVars = append(envVars, v1.EnvVar{Name: "ETCD_HOST", Value: c.OpConfig.EtcdHost})
 	}
@@ -1149,7 +1167,7 @@ func (c *Cluster) getPodEnvironmentSecretVariables() ([]v1.EnvVar, error) {
 
 	secret := &v1.Secret{}
 	var notFoundErr error
-	err := retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
+	err := retryutil.Retry(c.OpConfig.ResourceCheckInterval.Duration, c.OpConfig.ResourceCheckTimeout.Duration,
 		func() (bool, error) {
 			var err error
 			secret, err = c.KubeClient.Secrets(c.Namespace).Get(
@@ -1233,6 +1251,7 @@ func getSidecarContainer(sidecar acidv1.Sidecar, index int, resources *v1.Resour
 		Resources:       *resources,
 		Env:             sidecar.Env,
 		Ports:           sidecar.Ports,
+		Command:         sidecar.Command,
 	}
 }
 
@@ -1282,6 +1301,19 @@ func generateSpiloReadinessProbe() *v1.Probe {
 	}
 }
 
+func generateSpiloLivenessProbe(probe, defaultProbe *v1.Probe) *v1.Probe {
+
+	if probe != nil {
+		return probe
+	}
+
+	if defaultProbe != nil {
+		return defaultProbe
+	}
+
+	return nil
+}
+
 func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.StatefulSet, error) {
 
 	var (
@@ -1300,32 +1332,13 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 		return nil, fmt.Errorf("could not generate resource requirements: %v", err)
 	}
 
-	if spec.InitContainers != nil && len(spec.InitContainers) > 0 {
+	if len(spec.InitContainers) > 0 {
 		if c.OpConfig.EnableInitContainers != nil && !(*c.OpConfig.EnableInitContainers) {
 			c.logger.Warningf("initContainers specified but disabled in configuration - next statefulset creation would fail")
 		}
 		initContainers = spec.InitContainers
-	}
-
-	// backward compatible check for InitContainers
-	if spec.InitContainersOld != nil {
-		msg := "manifest parameter init_containers is deprecated."
-		if spec.InitContainers == nil {
-			c.logger.Warningf("%s Consider using initContainers instead.", msg)
-			spec.InitContainers = spec.InitContainersOld
-		} else {
-			c.logger.Warningf("%s Only value from initContainers is used", msg)
-		}
-	}
-
-	// backward compatible check for PodPriorityClassName
-	if spec.PodPriorityClassNameOld != "" {
-		msg := "manifest parameter pod_priority_class_name is deprecated."
-		if spec.PodPriorityClassName == "" {
-			c.logger.Warningf("%s Consider using podPriorityClassName instead.", msg)
-			spec.PodPriorityClassName = spec.PodPriorityClassNameOld
-		} else {
-			c.logger.Warningf("%s Only value from podPriorityClassName is used", msg)
+		if err := c.validateContainers(initContainers); err != nil {
+			return nil, fmt.Errorf("invalid init containers: %v", err)
 		}
 	}
 
@@ -1342,22 +1355,6 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 
 	// pickup the docker image for the spilo container
 	effectiveDockerImage := util.Coalesce(spec.DockerImage, c.OpConfig.DockerImage)
-
-	// determine the User, Group and FSGroup for the spilo pod
-	effectiveRunAsUser := c.OpConfig.Resources.SpiloRunAsUser
-	if spec.SpiloRunAsUser != nil {
-		effectiveRunAsUser = spec.SpiloRunAsUser
-	}
-
-	effectiveRunAsGroup := c.OpConfig.Resources.SpiloRunAsGroup
-	if spec.SpiloRunAsGroup != nil {
-		effectiveRunAsGroup = spec.SpiloRunAsGroup
-	}
-
-	effectiveFSGroup := c.OpConfig.Resources.SpiloFSGroup
-	if spec.SpiloFSGroup != nil {
-		effectiveFSGroup = spec.SpiloFSGroup
-	}
 
 	volumeMounts := generateVolumeMounts(spec.Volume)
 
@@ -1390,6 +1387,7 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 		&effectiveDockerImage,
 		resourceRequirements,
 		spiloEnvVars,
+		spec.EnvFrom,
 		volumeMounts,
 		c.OpConfig.Resources.SpiloPrivileged,
 		c.OpConfig.Resources.SpiloAllowPrivilegeEscalation,
@@ -1401,9 +1399,11 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 		spiloContainer.ReadinessProbe = generateSpiloReadinessProbe()
 	}
 
+	spiloContainer.LivenessProbe = generateSpiloLivenessProbe(spec.LivenessProbe, c.OpConfig.LivenessProbe)
+
 	// generate container specs for sidecars specified in the cluster manifest
 	clusterSpecificSidecars := []v1.Container{}
-	if spec.Sidecars != nil && len(spec.Sidecars) > 0 {
+	if len(spec.Sidecars) > 0 {
 		// warn if sidecars are defined, but globally disabled (does not apply to globally defined sidecars)
 		if c.OpConfig.EnableSidecars != nil && !(*c.OpConfig.EnableSidecars) {
 			c.logger.Warningf("sidecars specified but disabled in configuration - next statefulset creation would fail")
@@ -1450,12 +1450,16 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 	}
 
 	sidecarContainers, conflicts := mergeContainers(clusterSpecificSidecars, c.Config.OpConfig.SidecarContainers, globalSidecarContainersByDockerImage, scalyrSidecars)
-	for containerName := range conflicts {
+	for _, containerName := range conflicts {
 		c.logger.Warningf("a sidecar is specified twice. Ignoring sidecar %q in favor of %q with high a precedence",
 			containerName, containerName)
 	}
 
-	sidecarContainers = patchSidecarContainers(sidecarContainers, volumeMounts, c.OpConfig.SuperUsername, c.credentialSecretName(c.OpConfig.SuperUsername), c.logger)
+	sidecarContainers = patchSidecarContainers(sidecarContainers, volumeMounts, c.OpConfig.SuperUsername, c.credentialSecretName(c.OpConfig.SuperUsername))
+
+	if err := c.validateContainers(sidecarContainers); err != nil {
+		return nil, fmt.Errorf("invalid sidecar containers: %v", err)
+	}
 
 	tolerationSpec := tolerations(&spec.Tolerations, c.OpConfig.PodToleration)
 	effectivePodPriorityClassName := util.Coalesce(spec.PodPriorityClassName, c.OpConfig.PodPriorityClassName)
@@ -1471,13 +1475,11 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 		initContainers,
 		sidecarContainers,
 		c.OpConfig.SharePgSocketWithSidecars,
+		spec.TopologySpreadConstraints,
 		&tolerationSpec,
-		effectiveRunAsUser,
-		effectiveRunAsGroup,
-		effectiveFSGroup,
 		c.nodeAffinity(c.OpConfig.NodeReadinessLabel, spec.NodeAffinity),
 		spec.SchedulerName,
-		int64(c.OpConfig.PodTerminateGracePeriod.Seconds()),
+		int64(util.CoalesceDuration(c.OpConfig.PodTerminateGracePeriod, "5m").Seconds()),
 		c.OpConfig.PodServiceAccountName,
 		c.OpConfig.KubeIAMRole,
 		effectivePodPriorityClassName,
@@ -1507,11 +1509,12 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 	updateStrategy := appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType}
 
 	var podManagementPolicy appsv1.PodManagementPolicyType
-	if c.OpConfig.PodManagementPolicy == "ordered_ready" {
+	switch c.OpConfig.PodManagementPolicy {
+	case "ordered_ready":
 		podManagementPolicy = appsv1.OrderedReadyPodManagement
-	} else if c.OpConfig.PodManagementPolicy == "parallel" {
+	case "parallel":
 		podManagementPolicy = appsv1.ParallelPodManagement
-	} else {
+	default:
 		return nil, fmt.Errorf("could not set the pod management policy to the unknown value: %v", c.OpConfig.PodManagementPolicy)
 	}
 
@@ -1530,10 +1533,11 @@ func (c *Cluster) generateStatefulSet(spec *acidv1.PostgresSpec) (*appsv1.Statef
 
 	statefulSet := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.statefulSetName(),
-			Namespace:   c.Namespace,
-			Labels:      c.labelsSet(true),
-			Annotations: c.AnnotationsToPropagate(c.annotationsSet(nil)),
+			Name:            c.statefulSetName(),
+			Namespace:       c.Namespace,
+			Labels:          c.labelsSet(true),
+			Annotations:     c.AnnotationsToPropagate(c.annotationsSet(nil)),
+			OwnerReferences: c.ownerReferences(),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:                             &numberOfInstances,
@@ -1608,7 +1612,7 @@ func (c *Cluster) generatePodAnnotations(spec *acidv1.PostgresSpec) map[string]s
 	for k, v := range c.OpConfig.CustomPodAnnotations {
 		annotations[k] = v
 	}
-	if spec != nil || spec.PodAnnotations != nil {
+	if spec.PodAnnotations != nil {
 		for k, v := range spec.PodAnnotations {
 			annotations[k] = v
 		}
@@ -1676,7 +1680,7 @@ func (c *Cluster) getNumberOfInstances(spec *acidv1.PostgresSpec) int32 {
 		}
 	}
 
-	if spec.StandbyCluster != nil {
+	if isStandbyCluster(spec) {
 		if newcur == 1 {
 			min = newcur
 			max = newcur
@@ -1869,7 +1873,7 @@ func (c *Cluster) generatePersistentVolumeClaimTemplate(volumeSize, volumeStorag
 		},
 		Spec: v1.PersistentVolumeClaimSpec{
 			AccessModes: []v1.PersistentVolumeAccessMode{v1.ReadWriteOnce},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceStorage: quantity,
 				},
@@ -1885,18 +1889,16 @@ func (c *Cluster) generatePersistentVolumeClaimTemplate(volumeSize, volumeStorag
 
 func (c *Cluster) generateUserSecrets() map[string]*v1.Secret {
 	secrets := make(map[string]*v1.Secret, len(c.pgUsers)+len(c.systemUsers))
-	namespace := c.Namespace
 	for username, pgUser := range c.pgUsers {
 		//Skip users with no password i.e. human users (they'll be authenticated using pam)
-		secret := c.generateSingleUserSecret(pgUser.Namespace, pgUser)
+		secret := c.generateSingleUserSecret(pgUser)
 		if secret != nil {
 			secrets[username] = secret
 		}
-		namespace = pgUser.Namespace
 	}
 	/* special case for the system user */
 	for _, systemUser := range c.systemUsers {
-		secret := c.generateSingleUserSecret(namespace, systemUser)
+		secret := c.generateSingleUserSecret(systemUser)
 		if secret != nil {
 			secrets[systemUser.Name] = secret
 		}
@@ -1905,7 +1907,7 @@ func (c *Cluster) generateUserSecrets() map[string]*v1.Secret {
 	return secrets
 }
 
-func (c *Cluster) generateSingleUserSecret(namespace string, pgUser spec.PgUser) *v1.Secret {
+func (c *Cluster) generateSingleUserSecret(pgUser spec.PgUser) *v1.Secret {
 	//Skip users with no password i.e. human users (they'll be authenticated using pam)
 	if pgUser.Password == "" {
 		if pgUser.Origin != spec.RoleOriginTeamsAPI {
@@ -1929,12 +1931,27 @@ func (c *Cluster) generateSingleUserSecret(namespace string, pgUser spec.PgUser)
 		lbls = c.connectionPoolerLabels("", false).MatchLabels
 	}
 
+	// Skip a controller ownerReference on user-credential secrets when the
+	// operator is configured to keep them (enable_secrets_deletion=false);
+	// otherwise Kubernetes garbage collection would still cascade-delete them
+	// once the owning Postgresql CR is removed, defeating that setting.
+	// Cross-namespace secrets also have no ownerReference because K8s forbids
+	// cross-namespace ownerRefs by design.
+	var ownerReferences []metav1.OwnerReference
+	secretsDeletionDisabled := c.OpConfig.EnableSecretsDeletion != nil && !*c.OpConfig.EnableSecretsDeletion
+	if secretsDeletionDisabled || (c.Config.OpConfig.EnableCrossNamespaceSecret && c.Postgresql.ObjectMeta.Namespace != pgUser.Namespace) {
+		ownerReferences = nil
+	} else {
+		ownerReferences = c.ownerReferences()
+	}
+
 	secret := v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.credentialSecretName(username),
-			Namespace:   pgUser.Namespace,
-			Labels:      lbls,
-			Annotations: c.annotationsSet(nil),
+			Name:            c.credentialSecretName(username),
+			Namespace:       pgUser.Namespace,
+			Labels:          lbls,
+			Annotations:     c.annotationsSet(nil),
+			OwnerReferences: ownerReferences,
 		},
 		Type: v1.SecretTypeOpaque,
 		Data: map[string][]byte{
@@ -1974,6 +1991,37 @@ func (c *Cluster) shouldCreateLoadBalancerForService(role PostgresRole, spec *ac
 
 }
 
+func (c *Cluster) shouldCreateNodePortForService(role PostgresRole, spec *acidv1.PostgresSpec) (bool, int32) {
+	switch role {
+	case Replica:
+		// if the value is explicitly set in a Postgresql manifest, follow this setting
+		if spec.EnableReplicaNodePort != nil {
+			port := int32(0)
+			if spec.ReplicaNodePort != nil {
+				port = *spec.ReplicaNodePort
+			}
+
+			return *spec.EnableReplicaNodePort, port
+		}
+
+		// otherwise, follow the operator configuration
+		return c.OpConfig.EnableReplicaNodePort, 0
+	case Master:
+		if spec.EnableMasterNodePort != nil {
+			port := int32(0)
+			if spec.MasterNodePort != nil {
+				port = *spec.MasterNodePort
+			}
+
+			return *spec.EnableMasterNodePort, port
+		}
+
+		return c.OpConfig.EnableMasterNodePort, 0
+	default:
+		panic(fmt.Sprintf("Unknown role %v", role))
+	}
+}
+
 func (c *Cluster) generateService(role PostgresRole, spec *acidv1.PostgresSpec) *v1.Service {
 	serviceSpec := v1.ServiceSpec{
 		Ports: []v1.ServicePort{{Name: "postgresql", Port: pgPort, TargetPort: intstr.IntOrString{IntVal: pgPort}}},
@@ -1986,16 +2034,19 @@ func (c *Cluster) generateService(role PostgresRole, spec *acidv1.PostgresSpec) 
 		serviceSpec.Selector = c.roleLabelsSet(false, role)
 	}
 
-	if c.shouldCreateLoadBalancerForService(role, spec) {
+	if ok, port := c.shouldCreateNodePortForService(role, spec); ok {
+		c.configureNodePortService(&serviceSpec, port)
+	} else if c.shouldCreateLoadBalancerForService(role, spec) {
 		c.configureLoadBalanceService(&serviceSpec, spec.AllowedSourceRanges)
 	}
 
 	service := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.serviceName(role),
-			Namespace:   c.Namespace,
-			Labels:      c.roleLabelsSet(true, role),
-			Annotations: c.annotationsSet(c.generateServiceAnnotations(role, spec)),
+			Name:            c.serviceName(role),
+			Namespace:       c.Namespace,
+			Labels:          c.roleLabelsSet(true, role),
+			Annotations:     c.annotationsSet(c.generateServiceAnnotations(role, spec)),
+			OwnerReferences: c.ownerReferences(),
 		},
 		Spec: serviceSpec,
 	}
@@ -2018,17 +2069,23 @@ func (c *Cluster) configureLoadBalanceService(serviceSpec *v1.ServiceSpec, sourc
 	serviceSpec.Type = v1.ServiceTypeLoadBalancer
 }
 
+func (c *Cluster) configureNodePortService(serviceSpec *v1.ServiceSpec, port int32) {
+	serviceSpec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyType(c.OpConfig.ExternalTrafficPolicy)
+	serviceSpec.Type = v1.ServiceTypeNodePort
+
+	if port != 0 && len(serviceSpec.Ports) > 0 {
+		serviceSpec.Ports[0].NodePort = port
+	}
+}
+
 func (c *Cluster) generateServiceAnnotations(role PostgresRole, spec *acidv1.PostgresSpec) map[string]string {
 	annotations := c.getCustomServiceAnnotations(role, spec)
 
-	if c.shouldCreateLoadBalancerForService(role, spec) {
+	nodePort, _ := c.shouldCreateNodePortForService(role, spec)
+
+	if !nodePort && c.shouldCreateLoadBalancerForService(role, spec) {
 		dnsName := c.dnsName(role)
 
-		// Just set ELB Timeout annotation with default value, if it does not
-		// have a custom value
-		if _, ok := annotations[constants.ElbTimeoutAnnotationName]; !ok {
-			annotations[constants.ElbTimeoutAnnotationName] = constants.ElbTimeoutAnnotationValue
-		}
 		// External DNS name annotation is not customizable
 		annotations[constants.ZalandoDNSNameAnnotation] = dnsName
 	}
@@ -2061,10 +2118,11 @@ func (c *Cluster) getCustomServiceAnnotations(role PostgresRole, spec *acidv1.Po
 func (c *Cluster) generateEndpoint(role PostgresRole, subsets []v1.EndpointSubset) *v1.Endpoints {
 	endpoints := &v1.Endpoints{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.endpointName(role),
-			Namespace:   c.Namespace,
-			Annotations: c.annotationsSet(nil),
-			Labels:      c.roleLabelsSet(true, role),
+			Name:            c.serviceName(role),
+			Namespace:       c.Namespace,
+			Annotations:     c.annotationsSet(nil),
+			Labels:          c.roleLabelsSet(true, role),
+			OwnerReferences: c.ownerReferences(),
 		},
 	}
 	if len(subsets) > 0 {
@@ -2165,6 +2223,12 @@ func (c *Cluster) generateCloneEnvironment(description *acidv1.CloneDescription)
 		}
 	}
 
+	if c.OpConfig.IRSARoleARN != "" {
+		result = append(result, v1.EnvVar{Name: "CLONE_AWS_ROLE_ARN", Value: c.OpConfig.IRSARoleARN})
+		result = append(result, v1.EnvVar{Name: "CLONE_AWS_WEB_IDENTITY_TOKEN_FILE", Value: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"})
+		result = append(result, v1.EnvVar{Name: "CLONE_AWS_REGION", Value: c.OpConfig.AWSRegion})
+	}
+
 	return result
 }
 
@@ -2183,31 +2247,43 @@ func (c *Cluster) generateStandbyEnvironment(description *acidv1.StandbyDescript
 				Value: description.StandbyPort,
 			})
 		}
-	} else {
-		c.logger.Info("standby cluster streaming from WAL location")
-		if description.S3WalPath != "" {
+		if description.StandbyPrimarySlotName != "" {
 			result = append(result, v1.EnvVar{
-				Name:  "STANDBY_WALE_S3_PREFIX",
-				Value: description.S3WalPath,
+				Name:  "STANDBY_PRIMARY_SLOT_NAME",
+				Value: description.StandbyPrimarySlotName,
 			})
-		} else if description.GSWalPath != "" {
-			result = append(result, v1.EnvVar{
-				Name:  "STANDBY_WALE_GS_PREFIX",
-				Value: description.GSWalPath,
-			})
-		} else {
-			c.logger.Error("no WAL path specified in standby section")
-			return result
 		}
+	}
 
+	// WAL archive can be specified with or without standby_host
+	if description.S3WalPath != "" {
+		c.logger.Info("standby cluster using S3 WAL archive")
+		result = append(result, v1.EnvVar{
+			Name:  "STANDBY_WALE_S3_PREFIX",
+			Value: description.S3WalPath,
+		})
 		result = append(result, v1.EnvVar{Name: "STANDBY_METHOD", Value: "STANDBY_WITH_WALE"})
 		result = append(result, v1.EnvVar{Name: "STANDBY_WAL_BUCKET_SCOPE_PREFIX", Value: ""})
+	} else if description.GSWalPath != "" {
+		c.logger.Info("standby cluster using GCS WAL archive")
+		result = append(result, v1.EnvVar{
+			Name:  "STANDBY_WALE_GS_PREFIX",
+			Value: description.GSWalPath,
+		})
+		result = append(result, v1.EnvVar{Name: "STANDBY_METHOD", Value: "STANDBY_WITH_WALE"})
+		result = append(result, v1.EnvVar{Name: "STANDBY_WAL_BUCKET_SCOPE_PREFIX", Value: ""})
+	}
+
+	if c.OpConfig.IRSARoleARN != "" {
+		result = append(result, v1.EnvVar{Name: "STANDBY_AWS_ROLE_ARN", Value: c.OpConfig.IRSARoleARN})
+		result = append(result, v1.EnvVar{Name: "STANDBY_AWS_WEB_IDENTITY_TOKEN_FILE", Value: "/var/run/secrets/eks.amazonaws.com/serviceaccount/token"})
+		result = append(result, v1.EnvVar{Name: "STANDBY_AWS_REGION", Value: c.OpConfig.AWSRegion})
 	}
 
 	return result
 }
 
-func (c *Cluster) generatePodDisruptionBudget() *policyv1.PodDisruptionBudget {
+func (c *Cluster) generatePrimaryPodDisruptionBudget() *policyv1.PodDisruptionBudget {
 	minAvailable := intstr.FromInt(1)
 	pdbEnabled := c.OpConfig.EnablePodDisruptionBudget
 	pdbMasterLabelSelector := c.OpConfig.PDBMasterLabelSelector
@@ -2223,15 +2299,57 @@ func (c *Cluster) generatePodDisruptionBudget() *policyv1.PodDisruptionBudget {
 		labels[c.OpConfig.PodRoleLabel] = string(Master)
 	}
 
+	// When master selector is disabled and synchronous_mode_strict is on, require
+	// master + synchronous_node_count (default 1) healthy pods for write quorum.
+	if pdbMasterLabelSelector != nil && !*pdbMasterLabelSelector && minAvailable.IntVal > 0 && c.Spec.SynchronousModeStrict {
+		minAvailable = intstr.FromInt32(int32(c.Spec.SynchronousNodeCount + 1))
+	}
+
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.podDisruptionBudgetName(),
-			Namespace:   c.Namespace,
-			Labels:      c.labelsSet(true),
-			Annotations: c.annotationsSet(nil),
+			Name:            c.PrimaryPodDisruptionBudgetName(),
+			Namespace:       c.Namespace,
+			Labels:          c.labelsSet(true),
+			Annotations:     c.annotationsSet(nil),
+			OwnerReferences: c.ownerReferences(),
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable: &minAvailable,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+		},
+	}
+}
+
+func (c *Cluster) generateCriticalOpPodDisruptionBudget() *policyv1.PodDisruptionBudget {
+	// MaxUnavailable: 0 blocks voluntary disruption of any pod carrying the
+	// critical-operation label, while keeping the budget satisfied when no
+	// pod matches (status.desiredHealthy stays 0 outside critical
+	// operations). The previous MinAvailable: N spec left desiredHealthy at
+	// N with zero matching pods during normal operation, permanently firing
+	// alerts like kube-prometheus-stack's KubePdbNotEnoughHealthyPods (#3020).
+	maxUnavailable := intstr.FromInt32(0)
+	pdbEnabled := c.OpConfig.EnablePodDisruptionBudget
+
+	// if PodDisruptionBudget is disabled or if there are no DB pods, allow all disruptions.
+	if (pdbEnabled != nil && !(*pdbEnabled)) || c.Spec.NumberOfInstances <= 0 {
+		maxUnavailable = intstr.FromString("100%")
+	}
+
+	labels := c.labelsSet(false)
+	labels["critical-operation"] = "true"
+
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            c.criticalOpPodDisruptionBudgetName(),
+			Namespace:       c.Namespace,
+			Labels:          c.labelsSet(true),
+			Annotations:     c.annotationsSet(nil),
+			OwnerReferences: c.ownerReferences(),
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: &maxUnavailable,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -2284,6 +2402,7 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 		&c.OpConfig.LogicalBackup.LogicalBackupDockerImage,
 		resourceRequirements,
 		envVars,
+		nil,
 		[]v1.VolumeMount{},
 		c.OpConfig.SpiloPrivileged, // use same value as for normal DB pods
 		c.OpConfig.SpiloAllowPrivilegeEscalation,
@@ -2309,6 +2428,8 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 
 	tolerationsSpec := tolerations(&spec.Tolerations, c.OpConfig.PodToleration)
 
+	topologySpreadConstraintsSpec := generateTopologySpreadConstraints(labels, spec.TopologySpreadConstraints)
+
 	// re-use the method that generates DB pod templates
 	if podTemplate, err = c.generatePodTemplate(
 		c.Namespace,
@@ -2318,13 +2439,11 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 		[]v1.Container{},
 		[]v1.Container{},
 		util.False(),
+		topologySpreadConstraintsSpec,
 		&tolerationsSpec,
-		nil,
-		nil,
-		nil,
 		c.nodeAffinity(c.OpConfig.NodeReadinessLabel, nil),
 		nil,
-		int64(c.OpConfig.PodTerminateGracePeriod.Seconds()),
+		int64(util.CoalesceDuration(c.OpConfig.PodTerminateGracePeriod, "5m").Seconds()),
 		c.OpConfig.PodServiceAccountName,
 		c.OpConfig.KubeIAMRole,
 		"",
@@ -2345,12 +2464,22 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 	// configure a batch job
 
 	jobSpec := batchv1.JobSpec{
-		Template: *podTemplate,
+		Template:                *podTemplate,
+		TTLSecondsAfterFinished: c.OpConfig.LogicalBackup.LogicalBackupTTLSecondsAfterFinished,
+	}
+
+	if jobSpec.TTLSecondsAfterFinished == nil {
+		defaultTTL := int32(86400)
+		jobSpec.TTLSecondsAfterFinished = &defaultTTL
 	}
 
 	// configure a cron job
 
 	jobTemplateSpec := batchv1.JobTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels:      labels,
+			Annotations: c.annotationsSet(annotations),
+		},
 		Spec: jobSpec,
 	}
 
@@ -2359,17 +2488,32 @@ func (c *Cluster) generateLogicalBackupJob() (*batchv1.CronJob, error) {
 		schedule = c.OpConfig.LogicalBackupSchedule
 	}
 
+	successfulJobsHistoryLimit := c.OpConfig.LogicalBackup.LogicalBackupSuccessfulJobsHistoryLimit
+	if successfulJobsHistoryLimit == nil {
+		defaultLimit := int32(3)
+		successfulJobsHistoryLimit = &defaultLimit
+	}
+
+	failedJobsHistoryLimit := c.OpConfig.LogicalBackup.LogicalBackupFailedJobsHistoryLimit
+	if failedJobsHistoryLimit == nil {
+		defaultLimit := int32(3)
+		failedJobsHistoryLimit = &defaultLimit
+	}
+
 	cronJob := &batchv1.CronJob{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        c.getLogicalBackupJobName(),
-			Namespace:   c.Namespace,
-			Labels:      c.labelsSet(true),
-			Annotations: c.annotationsSet(nil),
+			Name:            c.getLogicalBackupJobName(),
+			Namespace:       c.Namespace,
+			Labels:          labels,
+			Annotations:     c.annotationsSet(annotations),
+			OwnerReferences: c.ownerReferences(),
 		},
 		Spec: batchv1.CronJobSpec{
-			Schedule:          schedule,
-			JobTemplate:       jobTemplateSpec,
-			ConcurrencyPolicy: batchv1.ForbidConcurrent,
+			Schedule:                   schedule,
+			JobTemplate:                jobTemplateSpec,
+			ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+			SuccessfulJobsHistoryLimit: successfulJobsHistoryLimit,
+			FailedJobsHistoryLimit:     failedJobsHistoryLimit,
 		},
 	}
 
@@ -2478,7 +2622,9 @@ func (c *Cluster) generateLogicalBackupPodEnvVars() []v1.EnvVar {
 		}
 
 	case "gcs":
-		envVars = append(envVars, v1.EnvVar{Name: "LOGICAL_BACKUP_GOOGLE_APPLICATION_CREDENTIALS", Value: c.OpConfig.LogicalBackup.LogicalBackupGoogleApplicationCredentials})
+		if c.OpConfig.LogicalBackup.LogicalBackupGoogleApplicationCredentials != "" {
+			envVars = append(envVars, v1.EnvVar{Name: "LOGICAL_BACKUP_GOOGLE_APPLICATION_CREDENTIALS", Value: c.OpConfig.LogicalBackup.LogicalBackupGoogleApplicationCredentials})
+		}
 
 	case "az":
 		envVars = appendEnvVars(envVars, []v1.EnvVar{
@@ -2489,11 +2635,11 @@ func (c *Cluster) generateLogicalBackupPodEnvVars() []v1.EnvVar {
 			{
 				Name:  "LOGICAL_BACKUP_AZURE_STORAGE_CONTAINER",
 				Value: c.OpConfig.LogicalBackup.LogicalBackupAzureStorageContainer,
-			},
-			{
-				Name:  "LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_KEY",
-				Value: c.OpConfig.LogicalBackup.LogicalBackupAzureStorageAccountKey,
 			}}...)
+
+		if c.OpConfig.LogicalBackup.LogicalBackupAzureStorageAccountKey != "" {
+			envVars = append(envVars, v1.EnvVar{Name: "LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_KEY", Value: c.OpConfig.LogicalBackup.LogicalBackupAzureStorageAccountKey})
+		}
 	}
 
 	return envVars
@@ -2519,22 +2665,26 @@ func (c *Cluster) getLogicalBackupJobName() (jobName string) {
 // survived, we can't delete an object because it will affect the functioning
 // cluster).
 func (c *Cluster) ownerReferences() []metav1.OwnerReference {
-	controller := true
-
-	if c.Statefulset == nil {
-		c.logger.Warning("Cannot get owner reference, no statefulset")
-		return []metav1.OwnerReference{}
+	currentOwnerReferences := c.ObjectMeta.OwnerReferences
+	if c.OpConfig.EnableOwnerReferences == nil || !*c.OpConfig.EnableOwnerReferences {
+		return currentOwnerReferences
 	}
 
-	return []metav1.OwnerReference{
-		{
-			UID:        c.Statefulset.ObjectMeta.UID,
-			APIVersion: "apps/v1",
-			Kind:       "StatefulSet",
-			Name:       c.Statefulset.ObjectMeta.Name,
-			Controller: &controller,
-		},
+	for _, ownerRef := range currentOwnerReferences {
+		if ownerRef.UID == c.Postgresql.ObjectMeta.UID {
+			return currentOwnerReferences
+		}
 	}
+
+	controllerReference := metav1.OwnerReference{
+		UID:        c.Postgresql.ObjectMeta.UID,
+		APIVersion: acidv1.SchemeGroupVersion.Identifier(),
+		Kind:       acidv1.PostgresCRDResourceKind,
+		Name:       c.Postgresql.ObjectMeta.Name,
+		Controller: util.True(),
+	}
+
+	return append(currentOwnerReferences, controllerReference)
 }
 
 func ensurePath(file string, defaultDir string, defaultFile string) string {
@@ -2545,4 +2695,16 @@ func ensurePath(file string, defaultDir string, defaultFile string) string {
 		return path.Join(defaultDir, file)
 	}
 	return file
+}
+
+func (c *Cluster) validateContainers(containers []v1.Container) error {
+	for i, container := range containers {
+		if container.Name == "" {
+			return fmt.Errorf("container[%d]: name is required", i)
+		}
+		if container.Image == "" {
+			return fmt.Errorf("container '%v': image is required", container.Name)
+		}
+	}
+	return nil
 }
